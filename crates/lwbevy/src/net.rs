@@ -182,17 +182,12 @@ fn validate_teams(mut teams: Vec<TeamSetup>) -> io::Result<Vec<TeamSetup>> {
 pub fn join_lobby(addr: &str) -> io::Result<(NetSession, GameSpec)> {
     let stream = TcpStream::connect(addr)?;
     let mut session = NetSession::new(stream, 1, 0)?;
-    let msg = loop {
-        match session.recv_blocking()? {
-            Some(m) => break m,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "host disconnected during handshake",
-                ))
-            }
-        }
-    };
+    let msg = session.recv_blocking()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "host disconnected during handshake",
+        )
+    })?;
     match msg {
         NetMessage::StartGame {
             proto_version,

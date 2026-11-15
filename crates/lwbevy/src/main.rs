@@ -302,6 +302,7 @@ fn setup_world(
 // Simulation (FixedUpdate, 64 Hz)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // Bevy system parameters
 fn fixed_simulate(
     mut game: ResMut<LwGame>,
     setup: Res<MatchSetup>,
@@ -539,6 +540,7 @@ fn update_sprites(
 // Global keys (Update)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // Bevy system parameters
 fn global_keys(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,

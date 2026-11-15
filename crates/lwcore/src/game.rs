@@ -459,7 +459,7 @@ impl Game {
             for cx in 0..self.map.width {
                 if !self.map.is_wall(cx, cy) {
                     let d = (cx as i64 - x).abs().max((cy as i64 - y).abs()) as u32;
-                    if best.map_or(true, |(bd, _)| d < bd) {
+                    if best.is_none_or(|(bd, _)| d < bd) {
                         best = Some((d, (cx, cy)));
                     }
                 }
