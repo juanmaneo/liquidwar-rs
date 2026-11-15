@@ -164,26 +164,28 @@ impl Map {
     }
 
     /// Parse ASCII art. `#` = wall, `.` or space = floor, `1`..`6` = floor and
-    /// a start position for that team. Returns the map and the start list
-    /// (indices 0-5 → positions).
+    /// a start position for that team. Rows shorter than the longest one are
+    /// padded with walls, so every map is fully bordered on the right and
+    /// bottom. Returns the map and the start list (indices 0-5 → positions).
     pub fn from_ascii(rows: &[&str]) -> (Map, Vec<(u32, u32)>) {
         let height = rows.len() as u32;
         let width = rows.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
         let mut map = Map::new(width, height);
         let mut starts: Vec<Option<(u32, u32)>> = vec![None; MAX_TEAMS];
         for (y, row) in rows.iter().enumerate() {
-            for (x, ch) in row.chars().enumerate() {
-                let (x, y) = (x as u32, y as u32);
+            let y = y as u32;
+            for x in 0..width {
+                let ch = row.chars().nth(x as usize);
                 match ch {
-                    '#' => map.set_wall(x, y, true),
-                    '.' | ' ' => {}
-                    '1'..='6' => {
-                        let t = (ch as u8 - b'1') as usize;
+                    None | Some('#') => map.set_wall(x, y, true),
+                    Some('.') | Some(' ') => {}
+                    Some(c @ '1'..='6') => {
+                        let t = (c as u8 - b'1') as usize;
                         if t < MAX_TEAMS {
                             starts[t] = Some((x, y));
                         }
                     }
-                    _ => {}
+                    Some(_) => {}
                 }
             }
         }
