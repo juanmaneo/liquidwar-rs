@@ -21,7 +21,6 @@ use lwcore::game::{Command, Game, GameParams, Scoreboard};
 use lwcore::map::Map;
 use lwcore::proto::{Move, NetMessage, TeamSetup, PROTO_VERSION};
 
-
 mod bot;
 mod net;
 
@@ -70,6 +69,10 @@ struct MatchSetup {
 #[derive(Resource)]
 struct PendingInputs(Vec<(u64, Command)>);
 
+/// Simulation tick for which the local input has already been queued/sent.
+#[derive(Resource, Default)]
+struct LastInputTick(Option<u64>);
+
 /// State fingerprint per completed tick (for desync checks).
 #[derive(Resource)]
 struct LocalHashes(Vec<u64>);
@@ -110,10 +113,7 @@ fn map_with_starts(name: &str, seed: u64) -> (Map, Vec<(u32, u32)>) {
     match name {
         "corridors" => Map::corridors(),
         "islands" => Map::islands(seed),
-        _ => (
-            Map::arena(),
-            vec![(10, 72), (182, 72), (96, 10), (96, 134)],
-        ),
+        _ => (Map::arena(), vec![(10, 72), (182, 72), (96, 10), (96, 134)]),
     }
 }
 
@@ -300,6 +300,7 @@ fn fixed_simulate(
     mut game: ResMut<LwGame>,
     setup: Res<MatchSetup>,
     mut pending: ResMut<PendingInputs>,
+    mut last_input_tick: ResMut<LastInputTick>,
     mut net: ResMut<NetOpt>,
     mut hashes: ResMut<LocalHashes>,
     mut desync: ResMut<Desync>,
@@ -323,7 +324,15 @@ fn fixed_simulate(
             match session.try_recv() {
                 Ok(None) => break,
                 Ok(Some(NetMessage::Input { tick: t, team, mv })) => {
-                    pending.0.push((t, mv.to_command(team)));
+                    // Keep the first command received for each peer team/tick.
+                    // A duplicate must not be applied twice if the sender retries.
+                    if !pending
+                        .0
+                        .iter()
+                        .any(|(queued_tick, cmd)| *queued_tick == t && command_team(cmd) == team)
+                    {
+                        pending.0.push((t, mv.to_command(team)));
+                    }
                 }
                 Ok(Some(NetMessage::HashCheck { tick: t, hash })) => {
                     if hashes.0.get(t as usize).copied() != Some(hash) {
@@ -366,21 +375,19 @@ fn fixed_simulate(
         dx: 0,
         dy: 0,
     });
-    pending.0.push((tick + delay, cmd));
-    if let Some(session) = net.0.as_mut() {
-        let mv = Move::from_command(cmd);
-        let _ = session.send_input(tick, mouse_team, mv);
+    if last_input_tick.0 != Some(tick) {
+        pending.0.push((tick + delay, cmd));
+        if let Some(session) = net.0.as_mut() {
+            let mv = Move::from_command(cmd);
+            let _ = session.send_input(tick, mouse_team, mv);
+        }
+        last_input_tick.0 = Some(tick);
     }
     if setup.mode == Mode::Local {
         if let Some((dx, dy)) = key_direction(&keys) {
-            pending.0.push((
-                tick,
-                Command::MoveCursor {
-                    team: 1,
-                    dx,
-                    dy,
-                },
-            ));
+            pending
+                .0
+                .push((tick, Command::MoveCursor { team: 1, dx, dy }));
         }
     }
 
@@ -439,9 +446,7 @@ fn mouse_cursor_command(
     let view_h = map.height as f32 * CELL;
     let world_x = view_w / 2.0 + (mx / window.width() - 0.5) * view_w;
     let world_y = view_h / 2.0 - (my / window.height() - 0.5) * view_h;
-    let x = (world_x / CELL)
-        .floor()
-        .clamp(0.0, (map.width - 1) as f32) as u32;
+    let x = (world_x / CELL).floor().clamp(0.0, (map.width - 1) as f32) as u32;
     let y = (map.height as f32 - 1.0 - world_y / CELL + 0.5)
         .floor()
         .clamp(0.0, (map.height - 1) as f32) as u32;
@@ -499,18 +504,15 @@ fn update_sprites(
         let counts: Vec<String> = (0..board.counts.len())
             .map(|t| format!("{} {}", team_name(t as u8), board.counts[t]))
             .collect();
-        let secs_left = game
-            .0
-            .params
-            .duration_ticks
-            .saturating_sub(game.0.tick)
-            / 64;
+        let secs_left = game.0.params.duration_ticks.saturating_sub(game.0.tick) / 64;
         let mut line = format!("{}   {}", counts.join("  "), secs_left);
         if desync.0 {
             line.push_str("   DESYNC!");
         } else if let Some(board) = over.0.as_ref() {
             match board.winner() {
-                Some(w) => line.push_str(&format!("   {} WINS!  [R]estart  [Esc]uit", team_name(w))),
+                Some(w) => {
+                    line.push_str(&format!("   {} WINS!  [R]estart  [Esc]uit", team_name(w)))
+                }
                 None => line.push_str("   DRAW!  [R]estart  [Esc]uit"),
             }
         } else if matches!(setup.mode, Mode::Host | Mode::Join) {
@@ -530,6 +532,7 @@ fn global_keys(
     setup: Res<MatchSetup>,
     mut game: ResMut<LwGame>,
     mut pending: ResMut<PendingInputs>,
+    mut last_input_tick: ResMut<LastInputTick>,
     mut hashes: ResMut<LocalHashes>,
     mut desync: ResMut<Desync>,
     mut over: ResMut<OverRes>,
@@ -557,6 +560,7 @@ fn global_keys(
     sprites.0.clear();
     *game = LwGame(build_game(&setup));
     pending.0.clear();
+    last_input_tick.0 = None;
     hashes.0.clear();
     desync.0 = false;
     over.0 = None;
@@ -704,6 +708,7 @@ fn main() {
         .insert_resource(setup)
         .insert_resource(LwGame(game))
         .insert_resource(PendingInputs(Vec::new()))
+        .insert_resource(LastInputTick::default())
         .insert_resource(LocalHashes(Vec::new()))
         .insert_resource(Desync(false))
         .insert_resource(OverRes(None))
