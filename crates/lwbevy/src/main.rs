@@ -95,15 +95,13 @@ struct NetOpt(Option<NetSession>);
 #[derive(Resource)]
 struct BotOpt(Option<Bot>);
 
-/// Fighter sprite entities, in the same order as `game.fighters()`.
-#[derive(Resource)]
-struct FighterSprites(Vec<Entity>);
-
 #[derive(Component)]
 struct FighterTag;
 
 #[derive(Component)]
-struct CursorTag;
+struct CursorTag {
+    team: u8,
+}
 
 #[derive(Component)]
 struct WallTag;
@@ -221,7 +219,6 @@ fn setup_world(
     mut commands: Commands,
     game: Res<LwGame>,
     mut images: ResMut<Assets<Image>>,
-    mut sprites: ResMut<FighterSprites>,
 ) {
     let map = &game.0.map;
     let view_w = map.width as f32 * CELL;
@@ -261,14 +258,11 @@ fn setup_world(
 
     // Fighters: one colored square each, in game order.
     for f in game.0.fighters() {
-        let e = commands
-            .spawn((
-                Sprite::from_color(team_color(f.team), Vec2::splat(CELL * 0.9)),
-                Transform::from_translation(cell_to_world(map.height, f.x, f.y, 1.0)),
-                FighterTag,
-            ))
-            .id();
-        sprites.0.push(e);
+        commands.spawn((
+            Sprite::from_color(team_color(f.team), Vec2::splat(CELL * 0.9)),
+            Transform::from_translation(cell_to_world(map.height, f.x, f.y, 1.0)),
+            FighterTag,
+        ));
     }
 
     // Team cursors: bright blocks above everything but the text.
@@ -277,7 +271,7 @@ fn setup_world(
         commands.spawn((
             Sprite::from_color(team_color(t as u8), Vec2::splat(CELL * 1.7)),
             Transform::from_translation(cell_to_world(map.height, x, y, 2.0)),
-            CursorTag,
+            CursorTag { team: t as u8 },
         ));
     }
 
@@ -491,7 +485,7 @@ fn update_sprites(
     over: Res<OverRes>,
     desync: Res<Desync>,
     mut fighters: Query<(&mut Transform, &mut Sprite), With<FighterTag>>,
-    mut cursors: Query<&mut Transform, (With<CursorTag>, Without<FighterTag>)>,
+    mut cursors: Query<(&mut Transform, &CursorTag), Without<FighterTag>>,
     mut score: Query<&mut Text2d, With<ScoreTextTag>>,
 ) {
     let map_h = game.0.map.height;
@@ -507,8 +501,8 @@ fn update_sprites(
     }
 
     // Cursors.
-    for (i, mut tr) in cursors.iter_mut().enumerate() {
-        let (x, y) = game.0.cursor(i as u8);
+    for (mut tr, cursor) in cursors.iter_mut() {
+        let (x, y) = game.0.cursor(cursor.team);
         tr.translation = cell_to_world(map_h, x, y, 2.0);
     }
 
@@ -553,7 +547,6 @@ fn global_keys(
     mut over: ResMut<OverRes>,
     mut bot: ResMut<BotOpt>,
     mut net: ResMut<NetOpt>,
-    mut sprites: ResMut<FighterSprites>,
     fighters: Query<Entity, With<FighterTag>>,
     mut exit: EventWriter<AppExit>,
 ) {
@@ -572,7 +565,6 @@ fn global_keys(
     for e in fighters.iter() {
         commands.entity(e).despawn();
     }
-    sprites.0.clear();
     *game = LwGame(build_game(&setup));
     pending.0.clear();
     last_input_tick.0 = None;
@@ -583,14 +575,11 @@ fn global_keys(
         *b = Bot::new(1, setup.seed ^ 0xB0B_5EED);
     }
     for f in game.0.fighters() {
-        let e = commands
-            .spawn((
-                Sprite::from_color(team_color(f.team), Vec2::splat(CELL * 0.9)),
-                Transform::from_translation(cell_to_world(game.0.map.height, f.x, f.y, 1.0)),
-                FighterTag,
-            ))
-            .id();
-        sprites.0.push(e);
+        commands.spawn((
+            Sprite::from_color(team_color(f.team), Vec2::splat(CELL * 0.9)),
+            Transform::from_translation(cell_to_world(game.0.map.height, f.x, f.y, 1.0)),
+            FighterTag,
+        ));
     }
 }
 
@@ -733,7 +722,6 @@ fn main() {
         } else {
             None
         }))
-        .insert_resource(FighterSprites(Vec::new()))
         .add_systems(Startup, setup_world)
         .add_systems(FixedUpdate, fixed_simulate)
         .add_systems(Update, (global_keys, update_sprites).chain())
