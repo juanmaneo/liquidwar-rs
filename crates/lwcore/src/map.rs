@@ -63,6 +63,9 @@ impl Map {
     /// A map that is entirely walkable, surrounded by a one-cell wall border.
     pub fn empty_bordered(width: u32, height: u32) -> Map {
         let mut m = Map::new(width, height);
+        if width == 0 || height == 0 {
+            return m;
+        }
         for x in 0..width {
             m.set_wall(x, 0, true);
             m.set_wall(x, height - 1, true);
@@ -206,8 +209,9 @@ impl Map {
         }
         let width = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
         let height = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        let n = width as usize * height as usize;
-        if bytes.len() < 8 + n {
+        // Checked: on 32-bit targets `width * height` can wrap.
+        let n = (width as usize).checked_mul(height as usize)?;
+        if bytes.len() - 8 < n {
             return None;
         }
         let walls = bytes[8..8 + n].iter().map(|b| *b != 0).collect();
@@ -239,6 +243,21 @@ mod tests {
         assert_eq!(starts, vec![(1, 0), (3, 0)]);
         assert!(m.is_wall(0, 0));
         assert!(!m.is_wall(1, 0));
+    }
+
+    #[test]
+    fn from_bytes_rejects_huge_dimensions() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.push(0);
+        assert!(Map::from_bytes(&b).is_none());
+    }
+
+    #[test]
+    fn degenerate_bordered_maps_do_not_panic() {
+        assert_eq!(Map::empty_bordered(0, 5).floor_count(), 0);
+        assert_eq!(Map::empty_bordered(5, 0).floor_count(), 0);
     }
 
     #[test]

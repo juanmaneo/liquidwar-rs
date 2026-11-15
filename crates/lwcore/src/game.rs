@@ -155,7 +155,9 @@ impl Game {
     /// floor cell. Returns the new team index.
     pub fn add_team(&mut self, cursor: (u32, u32)) -> u8 {
         let team = self.cursors.len() as u8;
-        let clamped = self.nearest_floor(cursor.0 as i64, cursor.1 as i64);
+        let clamped = self
+            .nearest_floor(cursor.0 as i64, cursor.1 as i64)
+            .expect("map has no walkable cell for a cursor");
         self.cursors.push(clamped);
         self.cursor_last_step.push(-1);
         self.gradients
@@ -227,7 +229,9 @@ impl Game {
         }
         match cmd {
             Command::SetCursor { x, y, .. } => {
-                self.cursors[team] = self.nearest_floor(x as i64, y as i64);
+                if let Some(p) = self.nearest_floor(x as i64, y as i64) {
+                    self.cursors[team] = p;
+                }
             }
             Command::MoveCursor { dx, dy, .. } => {
                 let interval = self.params.cursor_step_interval as i64;
@@ -235,14 +239,13 @@ impl Game {
                     return; // too soon
                 }
                 let (cx, cy) = self.cursors[team];
-                // Try the full step; if blocked by a wall, slide along it.
-                for (tx, ty) in [
-                    (cx as i64 + dx as i64, cy as i64 + dy as i64),
-                    (cx as i64 + dx as i64, cy as i64),
-                    (cx as i64, cy as i64 + dy as i64),
-                ] {
-                    if self.map.in_bounds(tx, ty) && !self.map.is_wall(tx as u32, ty as u32) {
-                        self.cursors[team] = (tx as u32, ty as u32);
+                // Try the full step; if blocked, slide along the wall. Each
+                // candidate obeys the same corner rule as fighters (see
+                // `walkable_neighbor`): no diagonal step through a wall corner.
+                let (dx, dy) = (dx as i32, dy as i32);
+                for (sx, sy) in [(dx, dy), (dx, 0), (0, dy)] {
+                    if let Some((tx, ty)) = self.walkable_neighbor(cx, cy, sx, sy) {
+                        self.cursors[team] = (tx, ty);
                         self.cursor_last_step[team] = self.tick as i64;
                         return;
                     }
@@ -441,24 +444,28 @@ impl Game {
 
     /// Nearest floor cell to a point: itself if walkable, else the closest
     /// floor cell by Chebyshev distance (row-major tiebreak, deterministic).
-    pub fn nearest_floor(&self, x: i64, y: i64) -> (u32, u32) {
+    /// `None` when the map has no floor cell at all.
+    pub fn nearest_floor(&self, x: i64, y: i64) -> Option<(u32, u32)> {
+        if self.map.width == 0 || self.map.height == 0 {
+            return None;
+        }
         let x = x.clamp(0, self.map.width as i64 - 1);
         let y = y.clamp(0, self.map.height as i64 - 1);
         if !self.map.is_wall(x as u32, y as u32) {
-            return (x as u32, y as u32);
+            return Some((x as u32, y as u32));
         }
-        let mut best = (u32::MAX, (0u32, 0u32));
+        let mut best: Option<(u32, (u32, u32))> = None;
         for cy in 0..self.map.height {
             for cx in 0..self.map.width {
                 if !self.map.is_wall(cx, cy) {
                     let d = (cx as i64 - x).abs().max((cy as i64 - y).abs()) as u32;
-                    if d < best.0 {
-                        best = (d, (cx, cy));
+                    if best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, (cx, cy)));
                     }
                 }
             }
         }
-        best.1
+        best.map(|(_, p)| p)
     }
 
     pub fn cursor(&self, team: u8) -> (u32, u32) {
