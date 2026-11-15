@@ -28,6 +28,12 @@ use bot::Bot;
 use net::{GameSpec, NetSession};
 
 const TICK_HZ: f64 = 64.0;
+/// How far ahead of the local tick a peer may schedule an input. A peer can
+/// lead us by about one input delay, and its inputs are tagged a further
+/// input delay ahead; the extra slack covers a stalled barrier.
+const INPUT_WINDOW_TICKS: u64 = 2 * INPUT_DELAY_TICKS + 4;
+/// Upper bound on queued inputs, so a misbehaving peer cannot exhaust memory.
+const MAX_PENDING_INPUTS: usize = 4096;
 /// World size of one map cell.
 const CELL: f32 = 4.0;
 /// Fighters per army.
@@ -324,13 +330,15 @@ fn fixed_simulate(
             match session.try_recv() {
                 Ok(None) => break,
                 Ok(Some(NetMessage::Input { tick: t, team, mv })) => {
-                    // Keep the first command received for each peer team/tick.
-                    // A duplicate must not be applied twice if the sender retries.
-                    if !pending
+                    // Reject inputs outside the window the lockstep can
+                    // legitimately produce, so a hostile peer cannot grow
+                    // the queue without bound.
+                    let in_window = t >= tick && t <= tick + INPUT_WINDOW_TICKS;
+                    let duplicate = pending
                         .0
                         .iter()
-                        .any(|(queued_tick, cmd)| *queued_tick == t && command_team(cmd) == team)
-                    {
+                        .any(|(queued_tick, cmd)| *queued_tick == t && command_team(cmd) == team);
+                    if in_window && !duplicate && pending.0.len() < MAX_PENDING_INPUTS {
                         pending.0.push((t, mv.to_command(team)));
                     }
                 }
@@ -353,6 +361,11 @@ fn fixed_simulate(
                     break;
                 }
             }
+        }
+        if session.corrupt {
+            eprintln!("liquidwar-rs: malformed data from opponent, disconnecting");
+            exit.write(AppExit::Success);
+            return;
         }
         if err || session.closed {
             eprintln!("liquidwar-rs: connection lost");

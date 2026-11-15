@@ -18,6 +18,9 @@ use std::net::{TcpListener, TcpStream};
 
 use lwcore::proto::{Move, NetMessage, TeamSetup, INPUT_DELAY_TICKS, PROTO_VERSION};
 
+/// Largest accepted frame payload, in bytes.
+const MAX_FRAME_LEN: usize = 1 << 20;
+
 /// Everything needed to build one match. Produced by the host and shipped
 /// to the joiner inside [`NetMessage::StartGame`].
 #[derive(Clone, Debug)]
@@ -43,6 +46,10 @@ pub struct NetSession {
     recv_buf: Vec<u8>,
     /// Set when the peer closed the connection.
     pub closed: bool,
+    /// Set when the stream carried a malformed or oversized frame. The
+    /// stream can no longer be trusted to stay in sync, so the session
+    /// must be torn down.
+    pub corrupt: bool,
 }
 
 impl NetSession {
@@ -54,6 +61,7 @@ impl NetSession {
             remote_team,
             recv_buf: Vec::new(),
             closed: false,
+            corrupt: false,
         })
     }
 
@@ -97,7 +105,16 @@ impl NetSession {
     /// Blocking receive; `Ok(None)` means the peer hung up.
     pub fn recv_blocking(&mut self) -> io::Result<Option<NetMessage>> {
         self.stream.set_nonblocking(false)?;
-        while self.try_parse().is_none() {
+        loop {
+            if self.corrupt {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed frame from peer",
+                ));
+            }
+            if let Some(msg) = self.try_parse() {
+                return Ok(Some(msg));
+            }
             let mut chunk = [0u8; 8192];
             let n = self.stream.read(&mut chunk)?;
             if n == 0 {
@@ -106,18 +123,15 @@ impl NetSession {
             }
             self.recv_buf.extend_from_slice(&chunk[..n]);
         }
-        Ok(self.try_parse())
     }
 
     fn try_parse(&mut self) -> Option<NetMessage> {
-        if self.recv_buf.len() < 4 {
+        if self.corrupt || self.recv_buf.len() < 4 {
             return None;
         }
-        let len =
-            u32::from_le_bytes(self.recv_buf[0..4].try_into().unwrap()) as usize;
-        if len > 1 << 20 {
-            // Nonsense length: the stream is garbage; drop everything.
-            self.recv_buf.clear();
+        let len = u32::from_le_bytes(self.recv_buf[0..4].try_into().unwrap()) as usize;
+        if len > MAX_FRAME_LEN {
+            self.corrupt = true;
             return None;
         }
         if self.recv_buf.len() < 4 + len {
@@ -125,6 +139,9 @@ impl NetSession {
         }
         let msg = NetMessage::from_bytes(&self.recv_buf[4..4 + len]);
         self.recv_buf.drain(0..4 + len);
+        if msg.is_none() {
+            self.corrupt = true;
+        }
         msg
     }
 }
@@ -144,6 +161,21 @@ pub fn host_lobby(port: u16, spec: &GameSpec) -> io::Result<NetSession> {
         teams: spec.teams.clone(),
     })?;
     Ok(session)
+}
+
+/// Teams must be exactly `0..n` with no duplicates or gaps. Returns them
+/// sorted by team index, so positions and `team` fields always agree.
+fn validate_teams(mut teams: Vec<TeamSetup>) -> io::Result<Vec<TeamSetup>> {
+    teams.sort_by_key(|t| t.team);
+    for (i, t) in teams.iter().enumerate() {
+        if t.team as usize != i {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid team layout: expected team {i}, got {}", t.team),
+            ));
+        }
+    }
+    Ok(teams)
 }
 
 /// Join a match: connect, wait for the host's StartGame, build the spec.
@@ -177,6 +209,7 @@ pub fn join_lobby(addr: &str) -> io::Result<(NetSession, GameSpec)> {
                     ),
                 ));
             }
+            let teams = validate_teams(teams)?;
             let spec = GameSpec {
                 map_name,
                 seed,
