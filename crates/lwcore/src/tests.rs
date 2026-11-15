@@ -8,13 +8,8 @@
 
 use crate::game::{Command, Game, GameParams};
 use crate::map::Map;
-use crate::proto::{Move, NetMessage, TeamSetup};
+use crate::proto::{Move, NetMessage, TeamSetup, INPUT_DELAY_TICKS};
 use crate::rng::Rng;
-
-/// The lockstep input delay used by the netcode, in ticks. Peers send
-/// inputs for `tick + INPUT_DELAY_TICKS` so both sides have them in hand
-/// before the tick executes.
-pub const INPUT_DELAY_TICKS: u64 = 8;
 
 /// Names of all scenarios, in run order.
 pub const SCENARIOS: &[&str] = &[

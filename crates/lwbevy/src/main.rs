@@ -19,13 +19,13 @@ use bevy::text::JustifyText;
 use bevy::window::PrimaryWindow;
 use lwcore::game::{Command, Game, GameParams, Scoreboard};
 use lwcore::map::Map;
-use lwcore::proto::{Move, NetMessage, TeamSetup, PROTO_VERSION};
+use lwcore::proto::{Move, NetMessage, TeamSetup, INPUT_DELAY_TICKS};
 
 mod bot;
 mod net;
 
 use bot::Bot;
-use net::{GameSpec, NetSession, INPUT_DELAY_TICKS};
+use net::{GameSpec, NetSession};
 
 const TICK_HZ: f64 = 64.0;
 /// World size of one map cell.
@@ -730,6 +730,3 @@ fn main() {
 fn fnv_seed(name: &str) -> u64 {
     lwcore::hash::fnv1a64(name.as_bytes()) | 1
 }
-
-// Silence unused warnings for protocol items referenced only in net mode.
-const _: u16 = PROTO_VERSION;

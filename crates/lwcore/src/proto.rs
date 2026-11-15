@@ -10,6 +10,11 @@ use crate::game::Command;
 
 pub const PROTO_VERSION: u16 = 1;
 
+/// The lockstep input delay, in ticks. Peers send inputs for
+/// `tick + INPUT_DELAY_TICKS` so both sides have them in hand before the
+/// tick executes.
+pub const INPUT_DELAY_TICKS: u64 = 8;
+
 /// A cursor action on the wire — the serializable twin of [`Command``].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Move {

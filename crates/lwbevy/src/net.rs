@@ -16,10 +16,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use lwcore::proto::{Move, NetMessage, TeamSetup, PROTO_VERSION};
-
-/// Input delay of the lockstep, in ticks.
-pub const INPUT_DELAY_TICKS: u64 = 8;
+use lwcore::proto::{Move, NetMessage, TeamSetup, INPUT_DELAY_TICKS, PROTO_VERSION};
 
 /// Everything needed to build one match. Produced by the host and shipped
 /// to the joiner inside [`NetMessage::StartGame`].
