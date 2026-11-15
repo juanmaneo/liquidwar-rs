@@ -5,6 +5,7 @@
 //!   liquidwar-rs --vs-ai         player vs simple bot
 //!   liquidwar-rs --host 8080     host an online match on port 8080
 //!   liquidwar-rs --join host:8080  join an online match
+//!   Online play requires LIQUIDWAR_PASSWORD set to the same secret on both peers.
 //!   liquidwar-rs --map corridors   pick the map (arena|corridors|islands)
 //!
 //! Controls: P1 moves the red cursor with the mouse. P2 moves the blue
@@ -91,6 +92,23 @@ struct OverRes(Option<Scoreboard>);
 
 #[derive(Resource)]
 struct NetOpt(Option<NetSession>);
+
+#[derive(Resource, Default)]
+struct RestartState {
+    phase: RestartPhase,
+    id: u64,
+    request_sent: bool,
+    host_commit: bool,
+    joiner_commit: bool,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum RestartPhase {
+    #[default]
+    Idle,
+    HostWaitingReady,
+    JoinerPaused,
+}
 
 #[derive(Resource)]
 struct BotOpt(Option<Bot>);
@@ -296,13 +314,105 @@ fn setup_world(
 // Simulation (FixedUpdate, 64 Hz)
 // ---------------------------------------------------------------------------
 
+fn drain_net(
+    session: &mut NetSession,
+    pending: &mut PendingInputs,
+    hashes: &mut LocalHashes,
+    desync: &mut Desync,
+    restart: &mut RestartState,
+    tick: u64,
+    exit: &mut EventWriter<AppExit>,
+) -> bool {
+    let mut err = false;
+    loop {
+        match session.try_recv() {
+            Ok(None) => break,
+            Ok(Some(NetMessage::Input { tick: t, team, mv })) => {
+                let in_window = t >= tick && t <= tick.saturating_add(INPUT_WINDOW_TICKS);
+                let duplicate = pending
+                    .0
+                    .iter()
+                    .any(|(queued_tick, cmd)| *queued_tick == t && command_team(cmd) == team);
+                if in_window && !duplicate && pending.0.len() < MAX_PENDING_INPUTS {
+                    pending.0.push((t, mv.to_command(team)));
+                }
+            }
+            Ok(Some(NetMessage::HashCheck { tick: t, hash })) => {
+                if restart.phase == RestartPhase::Idle
+                    && hashes.0.get(t as usize).copied() != Some(hash)
+                {
+                    desync.0 = true;
+                    eprintln!("liquidwar-rs: DESYNC detected at tick {t}");
+                }
+            }
+            Ok(Some(NetMessage::RestartRequest)) => {
+                if session.local_team == 0 && restart.phase == RestartPhase::Idle {
+                    restart.id = restart.id.wrapping_add(1);
+                    let _ = session.send(&NetMessage::RestartPrepare {
+                        restart_id: restart.id,
+                    });
+                    restart.phase = RestartPhase::HostWaitingReady;
+                }
+            }
+            Ok(Some(NetMessage::RestartPrepare { restart_id })) => {
+                if session.local_team == 1 && restart.phase == RestartPhase::Idle {
+                    restart.id = restart_id;
+                    restart.request_sent = false;
+                    restart.phase = RestartPhase::JoinerPaused;
+                    let _ = session.send(&NetMessage::RestartReady { restart_id });
+                }
+            }
+            Ok(Some(NetMessage::RestartReady { restart_id })) => {
+                if session.local_team == 0
+                    && restart.phase == RestartPhase::HostWaitingReady
+                    && restart_id == restart.id
+                {
+                    restart.host_commit = true;
+                }
+            }
+            Ok(Some(NetMessage::RestartCommit { restart_id })) => {
+                if session.local_team == 1
+                    && restart.phase == RestartPhase::JoinerPaused
+                    && restart_id == restart.id
+                {
+                    restart.joiner_commit = true;
+                }
+            }
+            Ok(Some(NetMessage::Quit)) => {
+                println!("liquidwar-rs: opponent left the game");
+                exit.write(AppExit::Success);
+                return false;
+            }
+            Ok(Some(other)) => eprintln!("liquidwar-rs: unexpected message {other:?}"),
+            Err(_) => {
+                err = true;
+                break;
+            }
+        }
+    }
+    if session.corrupt {
+        eprintln!("liquidwar-rs: invalid authenticated data from opponent, disconnecting");
+        exit.write(AppExit::Success);
+        return false;
+    }
+    if err || session.closed {
+        eprintln!("liquidwar-rs: connection lost");
+        exit.write(AppExit::Success);
+        return false;
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)] // Bevy system parameters
 fn fixed_simulate(
+    mut commands: Commands,
+    fighters: Query<Entity, With<FighterTag>>,
     mut game: ResMut<LwGame>,
     setup: Res<MatchSetup>,
     mut pending: ResMut<PendingInputs>,
     mut last_input_tick: ResMut<LastInputTick>,
     mut net: ResMut<NetOpt>,
+    mut restart: ResMut<RestartState>,
     mut hashes: ResMut<LocalHashes>,
     mut desync: ResMut<Desync>,
     mut over: ResMut<OverRes>,
@@ -311,62 +421,49 @@ fn fixed_simulate(
     mut bot: ResMut<BotOpt>,
     mut exit: EventWriter<AppExit>,
 ) {
-    if desync.0 || over.0.is_some() {
-        return;
-    }
     let tick = game.0.tick;
     let net_mode = matches!(setup.mode, Mode::Host | Mode::Join);
     let delay = if net_mode { INPUT_DELAY_TICKS } else { 0 };
 
-    // 1) Drain the network: queue inputs, verify hash checks.
+    // Drain control messages even when simulation is paused, over, or desynced.
     if let Some(session) = net.0.as_mut() {
-        let mut err = false;
-        loop {
-            match session.try_recv() {
-                Ok(None) => break,
-                Ok(Some(NetMessage::Input { tick: t, team, mv })) => {
-                    // Reject inputs outside the window the lockstep can
-                    // legitimately produce, so a hostile peer cannot grow
-                    // the queue without bound.
-                    let in_window = t >= tick && t <= tick + INPUT_WINDOW_TICKS;
-                    let duplicate = pending
-                        .0
-                        .iter()
-                        .any(|(queued_tick, cmd)| *queued_tick == t && command_team(cmd) == team);
-                    if in_window && !duplicate && pending.0.len() < MAX_PENDING_INPUTS {
-                        pending.0.push((t, mv.to_command(team)));
-                    }
-                }
-                Ok(Some(NetMessage::HashCheck { tick: t, hash })) => {
-                    if hashes.0.get(t as usize).copied() != Some(hash) {
-                        desync.0 = true;
-                        eprintln!("liquidwar-rs: DESYNC detected at tick {t}");
-                    }
-                }
-                Ok(Some(NetMessage::Quit)) => {
-                    println!("liquidwar-rs: opponent left the game");
-                    exit.write(AppExit::Success);
-                    return;
-                }
-                Ok(Some(other)) => {
-                    eprintln!("liquidwar-rs: unexpected message {other:?}");
-                }
-                Err(_) => {
-                    err = true;
-                    break;
-                }
-            }
-        }
-        if session.corrupt {
-            eprintln!("liquidwar-rs: malformed data from opponent, disconnecting");
-            exit.write(AppExit::Success);
+        if !drain_net(
+            session,
+            &mut pending,
+            &mut hashes,
+            &mut desync,
+            &mut restart,
+            tick,
+            &mut exit,
+        ) {
             return;
         }
-        if err || session.closed {
-            eprintln!("liquidwar-rs: connection lost");
-            exit.write(AppExit::Success);
-            return;
+    }
+
+    if restart.host_commit {
+        restart.host_commit = false;
+        if let Some(session) = net.0.as_mut() {
+            let _ = session.send(&NetMessage::RestartCommit {
+                restart_id: restart.id,
+            });
         }
+        restart.phase = RestartPhase::Idle;
+        reset_match(
+            &mut commands, &fighters, &setup, &mut game, &mut pending,
+            &mut last_input_tick, &mut hashes, &mut desync, &mut over, &mut bot,
+        );
+    }
+    if restart.joiner_commit {
+        restart.joiner_commit = false;
+        restart.phase = RestartPhase::Idle;
+        reset_match(
+            &mut commands, &fighters, &setup, &mut game, &mut pending,
+            &mut last_input_tick, &mut hashes, &mut desync, &mut over, &mut bot,
+        );
+    }
+
+    if desync.0 || over.0.is_some() || restart.phase != RestartPhase::Idle {
+        return;
     }
 
     // 2) Human input. In net mode, exactly one input message per tick so
@@ -437,6 +534,45 @@ fn fixed_simulate(
 
     if let Some(board) = game.0.game_over() {
         over.0 = Some(board);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reset_match(
+    commands: &mut Commands,
+    fighters: &Query<Entity, With<FighterTag>>,
+    setup: &MatchSetup,
+    game: &mut LwGame,
+    pending: &mut PendingInputs,
+    last_input_tick: &mut LastInputTick,
+    hashes: &mut LocalHashes,
+    desync: &mut Desync,
+    over: &mut OverRes,
+    bot: &mut BotOpt,
+) {
+    for entity in fighters.iter() {
+        commands.entity(entity).despawn();
+    }
+    *game = LwGame(build_game(setup));
+    pending.0.clear();
+    last_input_tick.0 = None;
+    hashes.0.clear();
+    desync.0 = false;
+    over.0 = None;
+    if let Some(bot) = bot.0.as_mut() {
+        *bot = Bot::new(1, setup.seed ^ 0xB0B_5EED);
+    }
+    for fighter in game.0.fighters() {
+        commands.spawn((
+            Sprite::from_color(team_color(fighter.team), Vec2::splat(CELL * 0.9)),
+            Transform::from_translation(cell_to_world(
+                game.0.map.height,
+                fighter.x,
+                fighter.y,
+                1.0,
+            )),
+            FighterTag,
+        ));
     }
 }
 
@@ -547,6 +683,7 @@ fn global_keys(
     mut over: ResMut<OverRes>,
     mut bot: ResMut<BotOpt>,
     mut net: ResMut<NetOpt>,
+    mut restart: ResMut<RestartState>,
     fighters: Query<Entity, With<FighterTag>>,
     mut exit: EventWriter<AppExit>,
 ) {
@@ -560,27 +697,30 @@ fn global_keys(
     if !keys.just_pressed(KeyCode::KeyR) {
         return;
     }
-    // R: restart the match. Note: online restarts need both players to
-    // press R (documented v1 limitation).
-    for e in fighters.iter() {
-        commands.entity(e).despawn();
+    if matches!(setup.mode, Mode::Host | Mode::Join) {
+        if let Some(session) = net.0.as_mut() {
+            match setup.mode {
+                Mode::Host if restart.phase == RestartPhase::Idle => {
+                    restart.id = restart.id.wrapping_add(1);
+                    let _ = session.send(&NetMessage::RestartPrepare {
+                        restart_id: restart.id,
+                    });
+                    restart.phase = RestartPhase::HostWaitingReady;
+                }
+                Mode::Join if restart.phase == RestartPhase::Idle && !restart.request_sent => {
+                    let _ = session.send(&NetMessage::RestartRequest);
+                    restart.request_sent = true;
+                }
+                _ => {}
+            }
+        }
+        return;
     }
-    *game = LwGame(build_game(&setup));
-    pending.0.clear();
-    last_input_tick.0 = None;
-    hashes.0.clear();
-    desync.0 = false;
-    over.0 = None;
-    if let Some(b) = bot.0.as_mut() {
-        *b = Bot::new(1, setup.seed ^ 0xB0B_5EED);
-    }
-    for f in game.0.fighters() {
-        commands.spawn((
-            Sprite::from_color(team_color(f.team), Vec2::splat(CELL * 0.9)),
-            Transform::from_translation(cell_to_world(game.0.map.height, f.x, f.y, 1.0)),
-            FighterTag,
-        ));
-    }
+
+    reset_match(
+        &mut commands, &fighters, &setup, &mut game, &mut pending,
+        &mut last_input_tick, &mut hashes, &mut desync, &mut over, &mut bot,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -665,7 +805,8 @@ fn main() {
                 duration_ticks,
                 teams,
             };
-            let session = net::host_lobby(port, &spec)
+            let secret = online_password();
+            let session = net::host_lobby(port, &spec, &secret)
                 .unwrap_or_else(|e| panic!("liquidwar-rs: hosting failed: {e}"));
             setup.cursors = spec.teams.iter().map(|t| t.cursor).collect();
             net_session = Some(session);
@@ -675,7 +816,8 @@ fn main() {
                 eprintln!("liquidwar-rs: --join needs host:port");
                 std::process::exit(2);
             }
-            let (session, spec) = net::join_lobby(&addr)
+            let secret = online_password();
+            let (session, spec) = net::join_lobby(&addr, &secret)
                 .unwrap_or_else(|e| panic!("liquidwar-rs: joining failed: {e}"));
             setup.map_name = spec.map_name.clone();
             setup.seed = spec.seed;
@@ -717,6 +859,7 @@ fn main() {
         .insert_resource(Desync(false))
         .insert_resource(OverRes(None))
         .insert_resource(NetOpt(net_session))
+        .insert_resource(RestartState::default())
         .insert_resource(BotOpt(if mode == Mode::VsAi {
             Some(Bot::new(1, seed ^ 0xB0B_5EED))
         } else {
@@ -726,6 +869,13 @@ fn main() {
         .add_systems(FixedUpdate, fixed_simulate)
         .add_systems(Update, (global_keys, update_sprites).chain())
         .run();
+}
+
+fn online_password() -> String {
+    std::env::var("LIQUIDWAR_PASSWORD").unwrap_or_else(|_| {
+        eprintln!("liquidwar-rs: online play requires LIQUIDWAR_PASSWORD, shared with your opponent");
+        std::process::exit(2);
+    })
 }
 
 /// A stable seed per map name (FNV-1a), so every match of a given map

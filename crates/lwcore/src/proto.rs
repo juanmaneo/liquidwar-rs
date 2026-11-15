@@ -8,7 +8,7 @@
 
 use crate::game::Command;
 
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 
 /// The lockstep input delay, in ticks. Peers send inputs for
 /// `tick + INPUT_DELAY_TICKS` so both sides have them in hand before the
@@ -53,8 +53,12 @@ pub struct TeamSetup {
 /// little-endian `u32` length prefix followed by `NetMessage::to_bytes`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetMessage {
-    /// Greeting / version probe.
-    Hello { proto_version: u16 },
+    /// Host begins mutual authentication with a fresh random nonce.
+    Challenge { proto_version: u16, host_nonce: [u8; 32] },
+    /// Joiner proves knowledge of the pre-shared secret and contributes a nonce.
+    AuthResponse { client_nonce: [u8; 32], proof: [u8; 32] },
+    /// Host proves knowledge of the same secret.
+    AuthProof { proof: [u8; 32] },
     /// Host -> joiner: everything needed to build the identical game.
     StartGame {
         proto_version: u16,
@@ -69,6 +73,14 @@ pub enum NetMessage {
     HashCheck { tick: u64, hash: u64 },
     /// Graceful disconnect.
     Quit,
+    /// Joiner asks the host to coordinate a match restart.
+    RestartRequest,
+    /// Host pauses both peers and asks the joiner to acknowledge readiness.
+    RestartPrepare { restart_id: u64 },
+    /// Joiner is paused and ready for the coordinated restart.
+    RestartReady { restart_id: u64 },
+    /// Host commits the restart; both peers reset to tick zero.
+    RestartCommit { restart_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -169,9 +181,19 @@ impl NetMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            NetMessage::Hello { proto_version } => {
-                out.push(1);
+            NetMessage::Challenge { proto_version, host_nonce } => {
+                out.push(6);
                 put_u16(&mut out, *proto_version);
+                out.extend_from_slice(host_nonce);
+            }
+            NetMessage::AuthResponse { client_nonce, proof } => {
+                out.push(7);
+                out.extend_from_slice(client_nonce);
+                out.extend_from_slice(proof);
+            }
+            NetMessage::AuthProof { proof } => {
+                out.push(8);
+                out.extend_from_slice(proof);
             }
             NetMessage::StartGame {
                 proto_version,
@@ -205,6 +227,19 @@ impl NetMessage {
                 put_u64(&mut out, *hash);
             }
             NetMessage::Quit => out.push(5),
+            NetMessage::RestartRequest => out.push(9),
+            NetMessage::RestartPrepare { restart_id } => {
+                out.push(10);
+                put_u64(&mut out, *restart_id);
+            }
+            NetMessage::RestartReady { restart_id } => {
+                out.push(11);
+                put_u64(&mut out, *restart_id);
+            }
+            NetMessage::RestartCommit { restart_id } => {
+                out.push(12);
+                put_u64(&mut out, *restart_id);
+            }
         }
         out
     }
@@ -213,8 +248,18 @@ impl NetMessage {
     pub fn from_bytes(bytes: &[u8]) -> Option<NetMessage> {
         let mut r = Reader::new(bytes);
         let msg = match r.u8()? {
-            1 => NetMessage::Hello {
-                proto_version: r.u16()?,
+            6 => {
+                let proto_version = r.u16()?;
+                let host_nonce = r.take(32)?.try_into().ok()?;
+                NetMessage::Challenge { proto_version, host_nonce }
+            }
+            7 => {
+                let client_nonce = r.take(32)?.try_into().ok()?;
+                let proof = r.take(32)?.try_into().ok()?;
+                NetMessage::AuthResponse { client_nonce, proof }
+            }
+            8 => NetMessage::AuthProof {
+                proof: r.take(32)?.try_into().ok()?,
             },
             2 => {
                 let proto_version = r.u16()?;
@@ -258,6 +303,10 @@ impl NetMessage {
                 NetMessage::HashCheck { tick, hash }
             }
             5 => NetMessage::Quit,
+            9 => NetMessage::RestartRequest,
+            10 => NetMessage::RestartPrepare { restart_id: r.u64()? },
+            11 => NetMessage::RestartReady { restart_id: r.u64()? },
+            12 => NetMessage::RestartCommit { restart_id: r.u64()? },
             _ => return None,
         };
         // Trailing garbage = malformed.
@@ -276,9 +325,15 @@ mod tests {
     #[test]
     fn roundtrip_all_kinds() {
         let msgs = vec![
-            NetMessage::Hello {
+            NetMessage::Challenge {
                 proto_version: PROTO_VERSION,
+                host_nonce: [1; 32],
             },
+            NetMessage::AuthResponse {
+                client_nonce: [2; 32],
+                proof: [3; 32],
+            },
+            NetMessage::AuthProof { proof: [4; 32] },
             NetMessage::StartGame {
                 proto_version: PROTO_VERSION,
                 map_name: "islands".to_string(),
@@ -312,6 +367,10 @@ mod tests {
                 hash: 0xDEAD_BEEF_1234_5678,
             },
             NetMessage::Quit,
+            NetMessage::RestartRequest,
+            NetMessage::RestartPrepare { restart_id: 7 },
+            NetMessage::RestartReady { restart_id: 7 },
+            NetMessage::RestartCommit { restart_id: 7 },
         ];
         for m in &msgs {
             let bytes = m.to_bytes();

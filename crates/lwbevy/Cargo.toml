@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 lwcore = { path = "../lwcore" }
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.4"
 
 bevy = { version = "0.16", default-features = false, features = [
   "std",

@@ -42,10 +42,10 @@ cargo run --release -p lwbevy
 # versus the (simple) bot
 cargo run --release -p lwbevy -- --vs-ai
 
-# online: one player hosts...
-cargo run --release -p lwbevy -- --host 8080
-# ...the other joins
-cargo run --release -p lwbevy -- --join somehost.example:8080
+# Online peers must share a strong secret (not sent over the network).
+# The connection is authenticated but not encrypted.
+LIQUIDWAR_PASSWORD='use-a-long-random-secret' cargo run --release -p lwbevy -- --host 8080
+LIQUIDWAR_PASSWORD='use-a-long-random-secret' cargo run --release -p lwbevy -- --join somehost.example:8080
 
 # pick a battlefield
 cargo run --release -p lwbevy -- --vs-ai --map corridors
@@ -83,8 +83,9 @@ tools/
 - **`lwbevy`** renders one sprite per fighter, converts mouse/key input to
   `lwcore::Command`s, drives a deliberately simple greedy bot
   (`--vs-ai`), and implements **lockstep netplay** over TCP: peers exchange
-  only cursor commands (never state), with an 8-tick input delay and a
-  per-tick hash check that flags desyncs immediately.
+  only cursor commands (never state), with an 8-tick input delay, mutual
+  authentication using `LIQUIDWAR_PASSWORD`, HMAC-SHA256 frame integrity,
+  and a per-tick hash check that flags simulation desyncs.
 
 ### Netcode
 
@@ -109,11 +110,16 @@ occupancy, conserved fighter counts), cursor clamping/sliding along
 walls, liquid convergence of a full army, multi-team determinism, a full
 lockstep loopback through the wire protocol, and front-line battles.
 
-## Known limitations (v1)
+Online mode authenticates both peers and integrity-protects every frame,
+but does not encrypt traffic. Use a long, randomly generated shared secret;
+passwords are not transmitted, though an offline attacker can still attempt
+guesses against captured authentication proofs.
+
+## Known limitations (v2)
 
 - No graphical/sound polish: flat colored squares, one wall texture.
-- Online restarts are manual: both players must press R to restart in
-  sync (single-player restart while connected will desync the match).
+- Online restarts are coordinated: pressing R sends a restart request, the
+  host pauses both peers, and both reset together once the host commits.
 - The bot is deliberately simple, like the original's basic AI.
 - No GUI lobby: host/join is command-line only.
 - Max ~2 teams in the UI, although the core supports 6.
