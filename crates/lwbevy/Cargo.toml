@@ -1,0 +1,27 @@
+[package]
+name = "lwbevy"
+description = "Bevy 0.16 frontend of liquidwar-rs: rendering, input, AI, online play"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "liquidwar-rs"
+path = "src/main.rs"
+
+[dependencies]
+lwcore = { path = "../lwcore" }
+
+bevy = { version = "0.16", default-features = false, features = [
+  "std",
+  "multi_threaded",
+  "bevy_winit",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_log",
+  "default_font",
+  "x11",
+] }

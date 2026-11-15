@@ -1,0 +1,10 @@
+[package]
+name = "lwcore"
+description = "Deterministic Liquid War simulation core: maps, gradient pathfinding, fighters, lockstep protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Deliberately dependency-free: the core must build anywhere,
+# including wasm32-unknown-unknown, and must stay 100% deterministic.

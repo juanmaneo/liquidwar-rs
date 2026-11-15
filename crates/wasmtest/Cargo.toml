@@ -1,0 +1,11 @@
+[package]
+name = "wasmtest"
+description = "Runs the lwcore portable scenario suite compiled to wasm32-unknown-unknown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No bin section needed: src/main.rs is the implicit binary target.
+
+[dependencies]
+lwcore = { path = "../lwcore" }
