@@ -62,6 +62,27 @@ fn derive_keys(secret: &str) -> ([u8; 32], [u8; 32]) {
     )
 }
 
+/// A connected loopback socket pair for tests.
+#[cfg(test)]
+pub(crate) fn connected_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    (server, client)
+}
+
+/// Two authenticated sessions over one loopback connection.
+#[cfg(test)]
+pub(crate) fn test_sessions() -> (NetSession, NetSession) {
+    let (server, client) = connected_pair();
+    let (host_to_joiner, joiner_to_host) = derive_keys("test");
+    (
+        NetSession::with_keys(server, 0, 1, host_to_joiner, joiner_to_host).unwrap(),
+        NetSession::with_keys(client, 1, 0, joiner_to_host, host_to_joiner).unwrap(),
+    )
+}
+
 fn disconnected() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
@@ -108,7 +129,7 @@ impl NetSession {
     }
 
     #[cfg(test)]
-    fn with_keys(
+    pub(crate) fn with_keys(
         stream: TcpStream,
         local_team: u8,
         remote_team: u8,
@@ -441,14 +462,6 @@ mod tests {
                 },
             ],
         }
-    }
-
-    fn connected_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        (server, client)
     }
 
     #[test]

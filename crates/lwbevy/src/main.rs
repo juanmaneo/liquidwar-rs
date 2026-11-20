@@ -102,7 +102,7 @@ struct RestartState {
     joiner_commit: bool,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 enum RestartPhase {
     #[default]
     Idle,
@@ -233,11 +233,7 @@ fn command_team(cmd: &Command) -> u8 {
 // Startup
 // ---------------------------------------------------------------------------
 
-fn setup_world(
-    mut commands: Commands,
-    game: Res<LwGame>,
-    mut images: ResMut<Assets<Image>>,
-) {
+fn setup_world(mut commands: Commands, game: Res<LwGame>, mut images: ResMut<Assets<Image>>) {
     let map = &game.0.map;
     let view_w = map.width as f32 * CELL;
     let view_h = map.height as f32 * CELL;
@@ -314,6 +310,14 @@ fn setup_world(
 // Simulation (FixedUpdate, 64 Hz)
 // ---------------------------------------------------------------------------
 
+/// What the caller should do after the network has been drained.
+enum NetFlow {
+    /// Keep simulating.
+    Continue,
+    /// Stop simulating and quit the app.
+    Exit,
+}
+
 fn drain_net(
     session: &mut NetSession,
     pending: &mut PendingInputs,
@@ -321,8 +325,7 @@ fn drain_net(
     desync: &mut Desync,
     restart: &mut RestartState,
     tick: u64,
-    exit: &mut EventWriter<AppExit>,
-) -> bool {
+) -> NetFlow {
     let mut err = false;
     loop {
         match session.try_recv() {
@@ -380,8 +383,7 @@ fn drain_net(
             }
             Ok(Some(NetMessage::Quit)) => {
                 println!("liquidwar-rs: opponent left the game");
-                exit.write(AppExit::Success);
-                return false;
+                return NetFlow::Exit;
             }
             Ok(Some(other)) => eprintln!("liquidwar-rs: unexpected message {other:?}"),
             Err(_) => {
@@ -392,15 +394,13 @@ fn drain_net(
     }
     if session.corrupt {
         eprintln!("liquidwar-rs: invalid authenticated data from opponent, disconnecting");
-        exit.write(AppExit::Success);
-        return false;
+        return NetFlow::Exit;
     }
     if err || session.closed {
         eprintln!("liquidwar-rs: connection lost");
-        exit.write(AppExit::Success);
-        return false;
+        return NetFlow::Exit;
     }
-    true
+    NetFlow::Continue
 }
 
 #[allow(clippy::too_many_arguments)] // Bevy system parameters
@@ -427,16 +427,19 @@ fn fixed_simulate(
 
     // Drain control messages even when simulation is paused, over, or desynced.
     if let Some(session) = net.0.as_mut() {
-        if !drain_net(
+        match drain_net(
             session,
             &mut pending,
             &mut hashes,
             &mut desync,
             &mut restart,
             tick,
-            &mut exit,
         ) {
-            return;
+            NetFlow::Continue => {}
+            NetFlow::Exit => {
+                exit.write(AppExit::Success);
+                return;
+            }
         }
     }
 
@@ -449,16 +452,32 @@ fn fixed_simulate(
         }
         restart.phase = RestartPhase::Idle;
         reset_match(
-            &mut commands, &fighters, &setup, &mut game, &mut pending,
-            &mut last_input_tick, &mut hashes, &mut desync, &mut over, &mut bot,
+            &mut commands,
+            &fighters,
+            &setup,
+            &mut game,
+            &mut pending,
+            &mut last_input_tick,
+            &mut hashes,
+            &mut desync,
+            &mut over,
+            &mut bot,
         );
     }
     if restart.joiner_commit {
         restart.joiner_commit = false;
         restart.phase = RestartPhase::Idle;
         reset_match(
-            &mut commands, &fighters, &setup, &mut game, &mut pending,
-            &mut last_input_tick, &mut hashes, &mut desync, &mut over, &mut bot,
+            &mut commands,
+            &fighters,
+            &setup,
+            &mut game,
+            &mut pending,
+            &mut last_input_tick,
+            &mut hashes,
+            &mut desync,
+            &mut over,
+            &mut bot,
         );
     }
 
@@ -718,8 +737,16 @@ fn global_keys(
     }
 
     reset_match(
-        &mut commands, &fighters, &setup, &mut game, &mut pending,
-        &mut last_input_tick, &mut hashes, &mut desync, &mut over, &mut bot,
+        &mut commands,
+        &fighters,
+        &setup,
+        &mut game,
+        &mut pending,
+        &mut last_input_tick,
+        &mut hashes,
+        &mut desync,
+        &mut over,
+        &mut bot,
     );
 }
 
@@ -873,7 +900,9 @@ fn main() {
 
 fn online_password() -> String {
     std::env::var("LIQUIDWAR_PASSWORD").unwrap_or_else(|_| {
-        eprintln!("liquidwar-rs: online play requires LIQUIDWAR_PASSWORD, shared with your opponent");
+        eprintln!(
+            "liquidwar-rs: online play requires LIQUIDWAR_PASSWORD, shared with your opponent"
+        );
         std::process::exit(2);
     })
 }
@@ -882,4 +911,367 @@ fn online_password() -> String {
 /// starts from the same (deterministic) world.
 fn fnv_seed(name: &str) -> u64 {
     lwcore::hash::fnv1a64(name.as_bytes()) | 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::test_sessions;
+    use bevy::ecs::system::RunSystemOnce;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    /// Loopback sessions plus the resource state `drain_net` mutates.
+    struct Drain {
+        session: NetSession,
+        pending: PendingInputs,
+        hashes: LocalHashes,
+        desync: Desync,
+        restart: RestartState,
+        exits: Vec<AppExit>,
+    }
+
+    impl Drain {
+        fn new(session: NetSession) -> Self {
+            Self {
+                session,
+                pending: PendingInputs(vec![]),
+                hashes: LocalHashes(vec![]),
+                desync: Desync(false),
+                restart: RestartState::default(),
+                exits: vec![],
+            }
+        }
+
+        /// Returns `false` when the session asked the app to exit.
+        fn drain(&mut self, tick: u64) -> bool {
+            match drain_net(
+                &mut self.session,
+                &mut self.pending,
+                &mut self.hashes,
+                &mut self.desync,
+                &mut self.restart,
+                tick,
+            ) {
+                NetFlow::Continue => true,
+                NetFlow::Exit => {
+                    self.exits.push(AppExit::Success);
+                    false
+                }
+            }
+        }
+
+        /// Drain repeatedly until `done` holds; loopback delivery is fast but
+        /// not instantaneous, so retry instead of assuming one pass suffices.
+        fn until(&mut self, tick: u64, done: impl Fn(&Self) -> bool) {
+            for _ in 0..250 {
+                self.drain(tick);
+                if done(self) {
+                    return;
+                }
+                sleep(Duration::from_millis(2));
+            }
+            panic!("expected condition was not reached after draining");
+        }
+    }
+
+    #[test]
+    fn joiner_requested_restart_completes_on_both_sides() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = Drain::new(host_session);
+        let mut joiner = Drain::new(joiner_session);
+
+        // Joiner presses R: global_keys sends the request.
+        joiner.session.send(&NetMessage::RestartRequest).unwrap();
+
+        // Host pauses and asks the joiner to acknowledge.
+        host.until(0, |d| d.restart.phase == RestartPhase::HostWaitingReady);
+        assert_eq!(host.restart.phase, RestartPhase::HostWaitingReady);
+        assert_eq!(host.restart.id, 1);
+
+        // Joiner pauses and answers Ready.
+        joiner.until(0, |d| d.restart.phase == RestartPhase::JoinerPaused);
+        assert_eq!(joiner.restart.id, 1);
+        assert!(!joiner.restart.request_sent);
+
+        // Host sees Ready and commits.
+        host.until(0, |d| d.restart.host_commit);
+        assert_eq!(host.restart.phase, RestartPhase::HostWaitingReady);
+
+        // fixed_simulate: host sends Commit and resets.
+        host.session
+            .send(&NetMessage::RestartCommit {
+                restart_id: host.restart.id,
+            })
+            .unwrap();
+        host.restart.phase = RestartPhase::Idle;
+        host.restart.host_commit = false;
+
+        // Joiner sees Commit and resets.
+        joiner.until(0, |d| d.restart.joiner_commit);
+        joiner.restart.phase = RestartPhase::Idle;
+        joiner.restart.joiner_commit = false;
+
+        assert_eq!(host.restart.phase, RestartPhase::Idle);
+        assert_eq!(joiner.restart.phase, RestartPhase::Idle);
+        assert!(!host.desync.0);
+        assert!(!joiner.desync.0);
+        assert!(host.exits.is_empty());
+        assert!(joiner.exits.is_empty());
+    }
+
+    #[test]
+    fn host_initiated_restart_completes_on_both_sides() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = Drain::new(host_session);
+        let mut joiner = Drain::new(joiner_session);
+
+        // Host presses R: global_keys sends Prepare directly.
+        host.restart.id = 1;
+        host.restart.phase = RestartPhase::HostWaitingReady;
+        host.session
+            .send(&NetMessage::RestartPrepare { restart_id: 1 })
+            .unwrap();
+
+        joiner.until(0, |d| d.restart.phase == RestartPhase::JoinerPaused);
+        assert_eq!(joiner.restart.id, 1);
+
+        host.until(0, |d| d.restart.host_commit);
+        host.session
+            .send(&NetMessage::RestartCommit {
+                restart_id: host.restart.id,
+            })
+            .unwrap();
+        host.restart.phase = RestartPhase::Idle;
+        host.restart.host_commit = false;
+
+        joiner.until(0, |d| d.restart.joiner_commit);
+        joiner.restart.phase = RestartPhase::Idle;
+        joiner.restart.joiner_commit = false;
+
+        assert_eq!(host.restart.phase, RestartPhase::Idle);
+        assert_eq!(joiner.restart.phase, RestartPhase::Idle);
+    }
+
+    #[test]
+    fn hash_checks_are_ignored_during_a_restart() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = Drain::new(host_session);
+        let mut joiner = Drain::new(joiner_session);
+
+        // A mismatching hash arriving while the joiner is paused is not a desync.
+        joiner.restart.phase = RestartPhase::JoinerPaused;
+        host.send_and_drain(&mut joiner, NetMessage::HashCheck { tick: 5, hash: 999 }, 0);
+        assert!(!joiner.desync.0);
+
+        // The same mismatch while idle is flagged.
+        joiner.restart.phase = RestartPhase::Idle;
+        host.send_and_drain(&mut joiner, NetMessage::HashCheck { tick: 6, hash: 999 }, 0);
+        assert!(joiner.desync.0);
+    }
+
+    #[test]
+    fn restart_messages_with_a_stale_id_are_ignored() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = Drain::new(host_session);
+        let mut joiner = Drain::new(joiner_session);
+
+        host.restart.id = 2;
+        host.restart.phase = RestartPhase::HostWaitingReady;
+
+        // Ready for an older restart must not commit. Drain for a grace
+        // period so the message has time to arrive and be processed.
+        joiner
+            .session
+            .send(&NetMessage::RestartReady { restart_id: 1 })
+            .unwrap();
+        for _ in 0..50 {
+            host.drain(0);
+            sleep(Duration::from_millis(2));
+        }
+        assert!(!host.restart.host_commit);
+        assert_eq!(host.restart.phase, RestartPhase::HostWaitingReady);
+
+        // Ready for the current restart commits.
+        joiner
+            .session
+            .send(&NetMessage::RestartReady { restart_id: 2 })
+            .unwrap();
+        host.until(0, |d| d.restart.host_commit);
+        assert!(host.restart.host_commit);
+    }
+
+    #[test]
+    fn inputs_are_windowed_and_deduped_per_team() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = Drain::new(host_session);
+        let mut joiner = Drain::new(joiner_session);
+        let tick = 100;
+        let due = tick + INPUT_DELAY_TICKS;
+
+        joiner
+            .session
+            .send(&NetMessage::Input {
+                tick: due,
+                team: 1,
+                mv: Move::Step { dx: 1, dy: 0 },
+            })
+            .unwrap();
+        // Duplicate for the same tick and team.
+        joiner
+            .session
+            .send(&NetMessage::Input {
+                tick: due,
+                team: 1,
+                mv: Move::Step { dx: -1, dy: 0 },
+            })
+            .unwrap();
+        // Too far in the future.
+        joiner
+            .session
+            .send(&NetMessage::Input {
+                tick: tick + INPUT_WINDOW_TICKS + 1,
+                team: 1,
+                mv: Move::Step { dx: 1, dy: 0 },
+            })
+            .unwrap();
+        // In the past.
+        joiner
+            .session
+            .send(&NetMessage::Input {
+                tick: 99,
+                team: 1,
+                mv: Move::Step { dx: 1, dy: 0 },
+            })
+            .unwrap();
+        // Same tick, other team: not a duplicate.
+        joiner
+            .session
+            .send(&NetMessage::Input {
+                tick: due,
+                team: 0,
+                mv: Move::Set { x: 5, y: 5 },
+            })
+            .unwrap();
+
+        host.until(tick, |d| d.pending.0.len() == 2);
+        assert_eq!(host.pending.0.len(), 2);
+        assert_eq!(host.pending.0[0].0, due);
+        assert_eq!(
+            host.pending.0[0].1,
+            Command::MoveCursor {
+                team: 1,
+                dx: 1,
+                dy: 0
+            }
+        );
+        assert_eq!(host.pending.0[1].0, due);
+        assert_eq!(
+            host.pending.0[1].1,
+            Command::SetCursor {
+                team: 0,
+                x: 5,
+                y: 5
+            }
+        );
+    }
+
+    #[test]
+    fn quit_message_ends_the_session() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = Drain::new(host_session);
+        let mut joiner = Drain::new(joiner_session);
+
+        joiner.session.send(&NetMessage::Quit).unwrap();
+        let mut ended = false;
+        for _ in 0..250 {
+            if !host.drain(0) {
+                ended = true;
+                break;
+            }
+            sleep(Duration::from_millis(2));
+        }
+        assert!(ended);
+        assert!(!host.exits.is_empty());
+    }
+
+    impl Drain {
+        /// Send from this side, then keep draining the other side for a
+        /// bounded grace period so the message is reliably consumed.
+        fn send_and_drain(&mut self, other: &mut Drain, msg: NetMessage, tick: u64) {
+            self.session.send(&msg).unwrap();
+            for _ in 0..50 {
+                other.drain(tick);
+                sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // Bevy system parameters
+    fn reset_system(
+        fighters: Query<Entity, With<FighterTag>>,
+        setup: Res<MatchSetup>,
+        mut game: ResMut<LwGame>,
+        mut pending: ResMut<PendingInputs>,
+        mut last_input_tick: ResMut<LastInputTick>,
+        mut hashes: ResMut<LocalHashes>,
+        mut desync: ResMut<Desync>,
+        mut over: ResMut<OverRes>,
+        mut bot: ResMut<BotOpt>,
+        mut commands: Commands,
+    ) {
+        reset_match(
+            &mut commands,
+            &fighters,
+            &setup,
+            &mut game,
+            &mut pending,
+            &mut last_input_tick,
+            &mut hashes,
+            &mut desync,
+            &mut over,
+            &mut bot,
+        );
+    }
+
+    #[test]
+    fn reset_match_clears_state_and_respawns_fighters() {
+        let mut world = World::new();
+        let setup = MatchSetup {
+            mode: Mode::Host,
+            map_name: "arena".to_string(),
+            seed: 42,
+            duration_ticks: 1000,
+            army_size: 8,
+            cursors: vec![(10, 72), (182, 72)],
+        };
+        world.insert_resource(LwGame(build_game(&setup)));
+        world.insert_resource(setup);
+        world.insert_resource(PendingInputs(vec![(
+            7,
+            Command::MoveCursor {
+                team: 1,
+                dx: 1,
+                dy: 0,
+            },
+        )]));
+        world.insert_resource(LastInputTick(Some(7)));
+        world.insert_resource(LocalHashes(vec![1, 2, 3]));
+        world.insert_resource(Desync(true));
+        world.insert_resource(OverRes(Some(Scoreboard { counts: vec![1, 1] })));
+        world.insert_resource(BotOpt(None));
+        world.spawn(FighterTag);
+
+        world.run_system_once(reset_system).unwrap();
+
+        assert!(world.resource::<PendingInputs>().0.is_empty());
+        assert_eq!(world.resource::<LastInputTick>().0, None);
+        assert!(world.resource::<LocalHashes>().0.is_empty());
+        assert!(!world.resource::<Desync>().0);
+        assert!(world.resource::<OverRes>().0.is_none());
+        // Two teams of eight fighters on a fresh game.
+        assert_eq!(world.resource::<LwGame>().0.total_fighters(), 16);
+        let mut fighters = world.query_filtered::<Entity, With<FighterTag>>();
+        assert_eq!(fighters.iter(&world).count(), 16);
+    }
 }
