@@ -109,7 +109,11 @@ fn cursor_wall_clamp() -> Result<(), String> {
     let mut g = Game::new(Map::arena(), GameParams::default(), 1);
     let t0 = g.add_team((96, 72));
 
-    g.command(Command::SetCursor { team: t0, x: 0, y: 0 });
+    g.command(Command::SetCursor {
+        team: t0,
+        x: 0,
+        y: 0,
+    });
     let (x, y) = g.cursor(t0);
     check(!g.map.is_wall(x, y), "cursor landed on a wall at (0,0)")?;
     check(
@@ -117,10 +121,21 @@ fn cursor_wall_clamp() -> Result<(), String> {
         format!("expected nearest floor (1,1), got ({x},{y})"),
     )?;
 
-    g.command(Command::SetCursor { team: t0, x: 95, y: 71 });
-    check(g.cursor(t0) == (95, 71), "free-cell SetCursor did not stick")?;
+    g.command(Command::SetCursor {
+        team: t0,
+        x: 95,
+        y: 71,
+    });
+    check(
+        g.cursor(t0) == (95, 71),
+        "free-cell SetCursor did not stick",
+    )?;
 
-    g.command(Command::SetCursor { team: t0, x: 500, y: 0 });
+    g.command(Command::SetCursor {
+        team: t0,
+        x: 500,
+        y: 0,
+    });
     let (x, y) = g.cursor(t0);
     check(
         !g.map.is_wall(x, y),
@@ -148,7 +163,11 @@ fn cursor_slides_along_walls() -> Result<(), String> {
     // never on a wall, never out of bounds. (MoveCursor is rate-limited,
     // so each step needs a tick.)
     for _ in 0..20 {
-        g.command(Command::MoveCursor { team: t0, dx: -1, dy: 0 });
+        g.command(Command::MoveCursor {
+            team: t0,
+            dx: -1,
+            dy: 0,
+        });
         g.tick();
         let (x, y) = g.cursor(t0);
         check(
@@ -199,7 +218,11 @@ fn army_converges() -> Result<(), String> {
     let spawned = g.spawn_army(t0, 300);
     check(spawned == 300, "army did not fully spawn")?;
 
-    g.command(Command::SetCursor { team: t0, x: 10, y: 10 });
+    g.command(Command::SetCursor {
+        team: t0,
+        x: 10,
+        y: 10,
+    });
     let gmax = g
         .fighters()
         .map(|f| g.gradient(t0, f.x, f.y))
@@ -367,8 +390,20 @@ fn lockstep_loopback_through_protocol() -> Result<(), String> {
         // 4) Hash-check exchange for this step (delivered next step).
         let hh = *host_hashes.last().unwrap();
         let jh = *join_hashes.last().unwrap();
-        wire_hj.push(NetMessage::HashCheck { tick: step, hash: hh }.to_bytes());
-        wire_jh.push(NetMessage::HashCheck { tick: step, hash: jh }.to_bytes());
+        wire_hj.push(
+            NetMessage::HashCheck {
+                tick: step,
+                hash: hh,
+            }
+            .to_bytes(),
+        );
+        wire_jh.push(
+            NetMessage::HashCheck {
+                tick: step,
+                hash: jh,
+            }
+            .to_bytes(),
+        );
 
         // 5) The two simulations must agree after every single step.
         check(
@@ -441,8 +476,16 @@ fn front_line_battles() -> Result<(), String> {
     check(g.spawn_army(t1, 150) == 150, "team1 army short")?;
 
     // Both cursors charge the middle: the armies flow into each other.
-    g.command(Command::SetCursor { team: t0, x: 96, y: 72 });
-    g.command(Command::SetCursor { team: t1, x: 96, y: 72 });
+    g.command(Command::SetCursor {
+        team: t0,
+        x: 96,
+        y: 72,
+    });
+    g.command(Command::SetCursor {
+        team: t1,
+        x: 96,
+        y: 72,
+    });
 
     let mut history: Vec<(usize, usize)> = Vec::new();
     for tick in 0..600 {
@@ -462,7 +505,10 @@ fn front_line_battles() -> Result<(), String> {
         "fighters were created or destroyed",
     )?;
     let (c0, c1) = (b.counts[0], b.counts[1]);
-    check(c0 != 150 || c1 != 150, "armies never met: no battle happened")?;
+    check(
+        c0 != 150 || c1 != 150,
+        "armies never met: no battle happened",
+    )?;
     // A team that is behind must have lost fighters to the other.
     if c0 != c1 {
         let (loser, winner) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
@@ -479,10 +525,7 @@ fn front_line_battles() -> Result<(), String> {
     )?;
     // And the end state must be consistent with the scoreboard's winner.
     match b.winner() {
-        Some(w) => check(
-            b.counts[w as usize] > 150,
-            "winner is not the bigger team",
-        )?,
+        Some(w) => check(b.counts[w as usize] > 150, "winner is not the bigger team")?,
         None => check(c0 == c1, "draw with unequal counts")?,
     }
     Ok(())

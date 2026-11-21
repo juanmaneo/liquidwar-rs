@@ -1,12 +1,14 @@
 //! Authenticated TCP lockstep netcode for liquidwar-rs.
 //!
 //! Peers authenticate each other with a pre-shared secret and fresh nonces.
-//! Every subsequent frame is authenticated with HMAC-SHA256 and a monotonic
-//! sequence number. The stream is authenticated but not encrypted.
+//! After mutual authentication, every frame is encrypted with ChaCha20-Poly1305
+//! using a monotonic sequence number as its per-direction nonce.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -16,7 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Largest accepted authenticated payload, in bytes.
 const MAX_FRAME_LEN: usize = 1 << 20;
-/// Sequence number, message tag, and truncated MAC.
+/// Sequence number, message tag, and authentication tag.
 const FRAME_HEADER_LEN: usize = 8 + 4 + 16;
 
 /// Everything needed to build one match. Produced by the host and shipped
@@ -53,13 +55,40 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
-/// Direction-separated keys prevent reflecting a valid frame back to its sender.
-fn derive_keys(secret: &str) -> ([u8; 32], [u8; 32]) {
-    let master = hmac_sha256(secret.as_bytes(), &[b"liquidwar-rs v2 session key"]);
+/// Temporary direction-separated keys protect the authentication handshake.
+fn derive_handshake_keys(secret: &str) -> ([u8; 32], [u8; 32]) {
+    let master = hmac_sha256(secret.as_bytes(), &[b"liquidwar-rs v3 handshake key"]);
     (
         hmac_sha256(&master, &[b"host to joiner"]),
         hmac_sha256(&master, &[b"joiner to host"]),
     )
+}
+
+/// Fresh nonces make traffic keys unique across connections, even if the same
+/// password is reused. Direction separation prevents nonce reuse between peers.
+fn derive_session_keys(
+    secret: &str,
+    host_nonce: &[u8; 32],
+    client_nonce: &[u8; 32],
+) -> ([u8; 32], [u8; 32]) {
+    let master = hmac_sha256(
+        secret.as_bytes(),
+        &[
+            b"liquidwar-rs v3 encrypted session",
+            host_nonce,
+            client_nonce,
+        ],
+    );
+    (
+        hmac_sha256(&master, &[b"host to joiner"]),
+        hmac_sha256(&master, &[b"joiner to host"]),
+    )
+}
+
+fn frame_nonce(seq: u64) -> Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&seq.to_le_bytes());
+    *Nonce::from_slice(&nonce)
 }
 
 /// A connected loopback socket pair for tests.
@@ -76,7 +105,7 @@ pub(crate) fn connected_pair() -> (TcpStream, TcpStream) {
 #[cfg(test)]
 pub(crate) fn test_sessions() -> (NetSession, NetSession) {
     let (server, client) = connected_pair();
-    let (host_to_joiner, joiner_to_host) = derive_keys("test");
+    let (host_to_joiner, joiner_to_host) = derive_session_keys("test", &[1; 32], &[2; 32]);
     (
         NetSession::with_keys(server, 0, 1, host_to_joiner, joiner_to_host).unwrap(),
         NetSession::with_keys(client, 1, 0, joiner_to_host, host_to_joiner).unwrap(),
@@ -103,12 +132,13 @@ pub struct NetSession {
     recv_key: [u8; 32],
     send_seq: u64,
     recv_seq: u64,
+    encrypted: bool,
 }
 
 impl NetSession {
     fn new(stream: TcpStream, local_team: u8, remote_team: u8, secret: &str) -> io::Result<Self> {
         stream.set_nodelay(true)?;
-        let (host_to_joiner, joiner_to_host) = derive_keys(secret);
+        let (host_to_joiner, joiner_to_host) = derive_handshake_keys(secret);
         let (send_key, recv_key) = if local_team == 0 {
             (host_to_joiner, joiner_to_host)
         } else {
@@ -125,7 +155,19 @@ impl NetSession {
             recv_key,
             send_seq: 0,
             recv_seq: 0,
+            encrypted: false,
         })
+    }
+
+    fn enable_encryption(&mut self, secret: &str, host_nonce: &[u8; 32], client_nonce: &[u8; 32]) {
+        let (host_to_joiner, joiner_to_host) =
+            derive_session_keys(secret, host_nonce, client_nonce);
+        (self.send_key, self.recv_key) = if self.local_team == 0 {
+            (host_to_joiner, joiner_to_host)
+        } else {
+            (joiner_to_host, host_to_joiner)
+        };
+        self.encrypted = true;
     }
 
     #[cfg(test)]
@@ -148,12 +190,13 @@ impl NetSession {
             recv_key,
             send_seq: 0,
             recv_seq: 0,
+            encrypted: true,
         })
     }
 
     /// Authenticate, frame, and send one message.
     pub fn send(&mut self, msg: &NetMessage) -> io::Result<()> {
-        let payload = msg.to_bytes();
+        let mut payload = msg.to_bytes();
         let Some(&message_tag) = payload.first() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -163,21 +206,47 @@ impl NetSession {
         let len = u32::try_from(FRAME_HEADER_LEN + payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
         let len_bytes = len.to_le_bytes();
+        let next_seq = self
+            .send_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "send sequence exhausted"))?;
         let seq_bytes = self.send_seq.to_le_bytes();
         let tag_bytes = u32::from(message_tag).to_le_bytes();
-        let tag = hmac_sha256(
-            &self.send_key,
-            &[&len_bytes, &seq_bytes, &tag_bytes, &payload],
-        );
+        let mut frame_tag = [0u8; 16];
+        if self.encrypted {
+            let cipher = ChaCha20Poly1305::new_from_slice(&self.send_key)
+                .expect("ChaCha20-Poly1305 key has fixed length");
+            let tag = cipher
+                .encrypt_in_place_detached(
+                    &frame_nonce(self.send_seq),
+                    &[
+                        len_bytes.as_slice(),
+                        seq_bytes.as_slice(),
+                        tag_bytes.as_slice(),
+                    ]
+                    .concat(),
+                    &mut payload,
+                )
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "frame encryption failed")
+                })?;
+            frame_tag.copy_from_slice(&tag);
+        } else {
+            let tag = hmac_sha256(
+                &self.send_key,
+                &[&len_bytes, &seq_bytes, &tag_bytes, &payload],
+            );
+            frame_tag.copy_from_slice(&tag[..16]);
+        }
 
         let mut frame = Vec::with_capacity(4 + len as usize);
         frame.extend_from_slice(&len_bytes);
         frame.extend_from_slice(&seq_bytes);
         frame.extend_from_slice(&tag_bytes);
-        frame.extend_from_slice(&tag[..16]);
+        frame.extend_from_slice(&frame_tag);
         frame.extend_from_slice(&payload);
         self.stream.write_all(&frame)?;
-        self.send_seq = self.send_seq.wrapping_add(1);
+        self.send_seq = next_seq;
         Ok(())
     }
 
@@ -248,26 +317,48 @@ impl NetSession {
 
         let seq_bytes: [u8; 8] = self.recv_buf[4..12].try_into().unwrap();
         let tag_bytes: [u8; 4] = self.recv_buf[12..16].try_into().unwrap();
-        let got_tag = &self.recv_buf[16..32];
-        let payload = &self.recv_buf[32..4 + len];
+        let got_tag: [u8; 16] = self.recv_buf[16..32].try_into().unwrap();
+        let mut payload = self.recv_buf[32..4 + len].to_vec();
         let seq = u64::from_le_bytes(seq_bytes);
         let message_tag = u32::from_le_bytes(tag_bytes);
-        let expected_tag = hmac_sha256(
-            &self.recv_key,
-            &[&len_bytes, &seq_bytes, &tag_bytes, payload],
-        );
 
-        if seq != self.recv_seq
-            || !constant_time_eq(&expected_tag[..16], got_tag)
-            || payload.first().copied() != Some(message_tag as u8)
-        {
+        if seq != self.recv_seq {
+            self.corrupt = true;
+            return None;
+        }
+        if self.encrypted {
+            let cipher = ChaCha20Poly1305::new_from_slice(&self.recv_key)
+                .expect("ChaCha20-Poly1305 key has fixed length");
+            let aad = [&len_bytes[..], &seq_bytes[..], &tag_bytes[..]].concat();
+            if cipher
+                .decrypt_in_place_detached(&frame_nonce(seq), &aad, &mut payload, (&got_tag).into())
+                .is_err()
+            {
+                self.corrupt = true;
+                return None;
+            }
+        } else {
+            let expected_tag = hmac_sha256(
+                &self.recv_key,
+                &[&len_bytes, &seq_bytes, &tag_bytes, &payload],
+            );
+            if !constant_time_eq(&expected_tag[..16], &got_tag) {
+                self.corrupt = true;
+                return None;
+            }
+        }
+        if payload.first().copied() != Some(message_tag as u8) {
             self.corrupt = true;
             return None;
         }
 
-        let msg = NetMessage::from_bytes(payload);
+        let Some(next_seq) = self.recv_seq.checked_add(1) else {
+            self.corrupt = true;
+            return None;
+        };
+        let msg = NetMessage::from_bytes(&payload);
         self.recv_buf.drain(..4 + len);
-        self.recv_seq = self.recv_seq.wrapping_add(1);
+        self.recv_seq = next_seq;
         if msg.is_none() {
             self.corrupt = true;
         }
@@ -303,7 +394,7 @@ fn host_on(listener: TcpListener, spec: &GameSpec, secret: &str) -> io::Result<N
         } => {
             let expected = hmac_sha256(
                 secret.as_bytes(),
-                &[b"lw2 client proof", &host_nonce, &client_nonce],
+                &[b"lw3 client proof", &host_nonce, &client_nonce],
             );
             if !constant_time_eq(&expected, &proof) {
                 let _ = session.send(&NetMessage::Quit);
@@ -324,8 +415,9 @@ fn host_on(listener: TcpListener, spec: &GameSpec, secret: &str) -> io::Result<N
 
     let proof = hmac_sha256(
         secret.as_bytes(),
-        &[b"lw2 host proof", &client_nonce, &host_nonce],
+        &[b"lw3 host proof", &client_nonce, &host_nonce],
     );
+    session.enable_encryption(secret, &host_nonce, &client_nonce);
     session.send(&NetMessage::AuthProof { proof })?;
     session.send(&NetMessage::StartGame {
         proto_version: PROTO_VERSION,
@@ -383,18 +475,19 @@ pub fn join_lobby(addr: &str, secret: &str) -> io::Result<(NetSession, GameSpec)
     getrandom::fill(&mut client_nonce).map_err(io::Error::other)?;
     let proof = hmac_sha256(
         secret.as_bytes(),
-        &[b"lw2 client proof", &host_nonce, &client_nonce],
+        &[b"lw3 client proof", &host_nonce, &client_nonce],
     );
     session.send(&NetMessage::AuthResponse {
         client_nonce,
         proof,
     })?;
+    session.enable_encryption(secret, &host_nonce, &client_nonce);
 
     match session.recv_blocking()?.ok_or_else(disconnected)? {
         NetMessage::AuthProof { proof } => {
             let expected = hmac_sha256(
                 secret.as_bytes(),
-                &[b"lw2 host proof", &client_nonce, &host_nonce],
+                &[b"lw3 host proof", &client_nonce, &host_nonce],
             );
             if !constant_time_eq(&expected, &proof) {
                 return Err(io::Error::new(
@@ -490,9 +583,46 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_frames_hide_payload_and_decrypt_for_peer() {
+        let (server, client) = connected_pair();
+        let (host_to_joiner, joiner_to_host) = derive_session_keys("secret", &[1; 32], &[2; 32]);
+        let mut host = NetSession::with_keys(server, 0, 1, host_to_joiner, joiner_to_host).unwrap();
+        let mut joiner =
+            NetSession::with_keys(client, 1, 0, joiner_to_host, host_to_joiner).unwrap();
+        assert!(host.encrypted);
+        assert!(joiner.encrypted);
+
+        let message = NetMessage::Input {
+            tick: 0x0102_0304_0506_0708,
+            team: 1,
+            mv: Move::Set {
+                x: 0x1122_3344,
+                y: 0x5566_7788,
+            },
+        };
+        let plaintext = message.to_bytes();
+        host.send(&message).unwrap();
+
+        let mut length = [0u8; 4];
+        joiner.stream.read_exact(&mut length).unwrap();
+        let frame_len = u32::from_le_bytes(length) as usize;
+        let mut frame = vec![0; frame_len];
+        joiner.stream.read_exact(&mut frame).unwrap();
+        assert_ne!(&frame[FRAME_HEADER_LEN..], plaintext.as_slice());
+        assert!(!frame[FRAME_HEADER_LEN..]
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
+
+        joiner.recv_buf.extend_from_slice(&length);
+        joiner.recv_buf.extend_from_slice(&frame);
+        assert_eq!(joiner.try_parse(), Some(message));
+        assert!(!joiner.corrupt);
+    }
+
+    #[test]
     fn frames_reject_tampering_and_replays() {
         let (server, client) = connected_pair();
-        let (host_to_joiner, joiner_to_host) = derive_keys("secret");
+        let (host_to_joiner, joiner_to_host) = derive_session_keys("secret", &[1; 32], &[2; 32]);
         let mut host = NetSession::with_keys(server, 0, 1, host_to_joiner, joiner_to_host).unwrap();
         let mut joiner =
             NetSession::with_keys(client, 1, 0, joiner_to_host, host_to_joiner).unwrap();

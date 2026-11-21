@@ -35,6 +35,7 @@ const TICK_HZ: f64 = 64.0;
 const INPUT_WINDOW_TICKS: u64 = 2 * INPUT_DELAY_TICKS + 4;
 /// Upper bound on queued inputs, so a misbehaving peer cannot exhaust memory.
 const MAX_PENDING_INPUTS: usize = 4096;
+const MAX_PENDING_HASHES: usize = 256;
 /// World size of one map cell.
 const CELL: f32 = 4.0;
 /// Fighters per army.
@@ -84,6 +85,10 @@ struct LastInputTick(Option<u64>);
 #[derive(Resource)]
 struct LocalHashes(Vec<u64>);
 
+/// Peer fingerprints that arrived before this side completed the same tick.
+#[derive(Resource, Default)]
+struct PendingHashes(Vec<(u64, u64)>);
+
 #[derive(Resource)]
 struct Desync(bool);
 
@@ -114,7 +119,9 @@ enum RestartPhase {
 struct BotOpt(Option<Bot>);
 
 #[derive(Component)]
-struct FighterTag;
+struct FighterTag {
+    id: usize,
+}
 
 #[derive(Component)]
 struct CursorTag {
@@ -275,7 +282,7 @@ fn setup_world(mut commands: Commands, game: Res<LwGame>, mut images: ResMut<Ass
         commands.spawn((
             Sprite::from_color(team_color(f.team), Vec2::splat(CELL * 0.9)),
             Transform::from_translation(cell_to_world(map.height, f.x, f.y, 1.0)),
-            FighterTag,
+            FighterTag { id: f.id },
         ));
     }
 
@@ -322,6 +329,7 @@ fn drain_net(
     session: &mut NetSession,
     pending: &mut PendingInputs,
     hashes: &mut LocalHashes,
+    pending_hashes: &mut PendingHashes,
     desync: &mut Desync,
     restart: &mut RestartState,
     tick: u64,
@@ -341,11 +349,38 @@ fn drain_net(
                 }
             }
             Ok(Some(NetMessage::HashCheck { tick: t, hash })) => {
-                if restart.phase == RestartPhase::Idle
-                    && hashes.0.get(t as usize).copied() != Some(hash)
-                {
-                    desync.0 = true;
-                    eprintln!("liquidwar-rs: DESYNC detected at tick {t}");
+                if restart.phase == RestartPhase::Idle {
+                    match usize::try_from(t)
+                        .ok()
+                        .and_then(|i| hashes.0.get(i).copied())
+                    {
+                        Some(local_hash) if local_hash == hash => {}
+                        Some(_) => {
+                            desync.0 = true;
+                            eprintln!("liquidwar-rs: DESYNC detected at tick {t}");
+                        }
+                        None if t >= tick
+                            && t <= tick.saturating_add(INPUT_WINDOW_TICKS)
+                            && pending_hashes.0.len() < MAX_PENDING_HASHES =>
+                        {
+                            if let Some((_, queued_hash)) = pending_hashes
+                                .0
+                                .iter()
+                                .find(|(queued_tick, _)| *queued_tick == t)
+                            {
+                                if *queued_hash != hash {
+                                    desync.0 = true;
+                                    eprintln!("liquidwar-rs: conflicting hash checks at tick {t}");
+                                }
+                            } else {
+                                pending_hashes.0.push((t, hash));
+                            }
+                        }
+                        None => {
+                            desync.0 = true;
+                            eprintln!("liquidwar-rs: DESYNC detected at tick {t}");
+                        }
+                    }
                 }
             }
             Ok(Some(NetMessage::RestartRequest)) => {
@@ -414,6 +449,7 @@ fn fixed_simulate(
     mut net: ResMut<NetOpt>,
     mut restart: ResMut<RestartState>,
     mut hashes: ResMut<LocalHashes>,
+    mut pending_hashes: ResMut<PendingHashes>,
     mut desync: ResMut<Desync>,
     mut over: ResMut<OverRes>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -431,6 +467,7 @@ fn fixed_simulate(
             session,
             &mut pending,
             &mut hashes,
+            &mut pending_hashes,
             &mut desync,
             &mut restart,
             tick,
@@ -459,6 +496,7 @@ fn fixed_simulate(
             &mut pending,
             &mut last_input_tick,
             &mut hashes,
+            &mut pending_hashes,
             &mut desync,
             &mut over,
             &mut bot,
@@ -475,6 +513,7 @@ fn fixed_simulate(
             &mut pending,
             &mut last_input_tick,
             &mut hashes,
+            &mut pending_hashes,
             &mut desync,
             &mut over,
             &mut bot,
@@ -522,7 +561,7 @@ fn fixed_simulate(
 
     // 4) Lockstep barrier: in net mode wait until the peer's input for
     //    this tick has arrived.
-    if net_mode {
+    if net_mode && tick >= INPUT_DELAY_TICKS {
         if let Some(session) = net.0.as_ref() {
             let have = pending
                 .0
@@ -547,6 +586,17 @@ fn fixed_simulate(
     game.0.tick();
     let h = game.0.state_hash();
     hashes.0.push(h);
+    if let Some(position) = pending_hashes
+        .0
+        .iter()
+        .position(|(queued_tick, _)| *queued_tick == tick)
+    {
+        let (_, peer_hash) = pending_hashes.0.remove(position);
+        if peer_hash != h {
+            desync.0 = true;
+            eprintln!("liquidwar-rs: DESYNC detected at tick {tick}");
+        }
+    }
     if let Some(session) = net.0.as_mut() {
         let _ = session.send(&NetMessage::HashCheck { tick, hash: h });
     }
@@ -565,6 +615,7 @@ fn reset_match(
     pending: &mut PendingInputs,
     last_input_tick: &mut LastInputTick,
     hashes: &mut LocalHashes,
+    pending_hashes: &mut PendingHashes,
     desync: &mut Desync,
     over: &mut OverRes,
     bot: &mut BotOpt,
@@ -576,6 +627,7 @@ fn reset_match(
     pending.0.clear();
     last_input_tick.0 = None;
     hashes.0.clear();
+    pending_hashes.0.clear();
     desync.0 = false;
     over.0 = None;
     if let Some(bot) = bot.0.as_mut() {
@@ -590,7 +642,7 @@ fn reset_match(
                 fighter.y,
                 1.0,
             )),
-            FighterTag,
+            FighterTag { id: fighter.id },
         ));
     }
 }
@@ -639,20 +691,19 @@ fn update_sprites(
     setup: Res<MatchSetup>,
     over: Res<OverRes>,
     desync: Res<Desync>,
-    mut fighters: Query<(&mut Transform, &mut Sprite), With<FighterTag>>,
+    mut fighters: Query<(&mut Transform, &mut Sprite, &FighterTag)>,
     mut cursors: Query<(&mut Transform, &CursorTag), Without<FighterTag>>,
     mut score: Query<&mut Text2d, With<ScoreTextTag>>,
 ) {
     let map_h = game.0.map.height;
 
-    // Fighters: game order matches sprite spawn order.
-    let mut it = fighters.iter_mut();
-    for f in game.0.fighters() {
-        let Some((mut tr, mut sp)) = it.next() else {
-            break;
-        };
-        tr.translation = cell_to_world(map_h, f.x, f.y, 1.0);
-        sp.color = team_color(f.team);
+    // Match entities by stable fighter ID rather than query iteration order.
+    let views: Vec<_> = game.0.fighters().collect();
+    for (mut tr, mut sp, tag) in &mut fighters {
+        if let Some(f) = views.get(tag.id).filter(|f| f.id == tag.id) {
+            tr.translation = cell_to_world(map_h, f.x, f.y, 1.0);
+            sp.color = team_color(f.team);
+        }
     }
 
     // Cursors.
@@ -698,6 +749,7 @@ fn global_keys(
     mut pending: ResMut<PendingInputs>,
     mut last_input_tick: ResMut<LastInputTick>,
     mut hashes: ResMut<LocalHashes>,
+    mut pending_hashes: ResMut<PendingHashes>,
     mut desync: ResMut<Desync>,
     mut over: ResMut<OverRes>,
     mut bot: ResMut<BotOpt>,
@@ -744,6 +796,7 @@ fn global_keys(
         &mut pending,
         &mut last_input_tick,
         &mut hashes,
+        &mut pending_hashes,
         &mut desync,
         &mut over,
         &mut bot,
@@ -883,6 +936,7 @@ fn main() {
         .insert_resource(PendingInputs(Vec::new()))
         .insert_resource(LastInputTick::default())
         .insert_resource(LocalHashes(Vec::new()))
+        .insert_resource(PendingHashes::default())
         .insert_resource(Desync(false))
         .insert_resource(OverRes(None))
         .insert_resource(NetOpt(net_session))
@@ -926,6 +980,7 @@ mod tests {
         session: NetSession,
         pending: PendingInputs,
         hashes: LocalHashes,
+        pending_hashes: PendingHashes,
         desync: Desync,
         restart: RestartState,
         exits: Vec<AppExit>,
@@ -937,6 +992,7 @@ mod tests {
                 session,
                 pending: PendingInputs(vec![]),
                 hashes: LocalHashes(vec![]),
+                pending_hashes: PendingHashes::default(),
                 desync: Desync(false),
                 restart: RestartState::default(),
                 exits: vec![],
@@ -949,6 +1005,7 @@ mod tests {
                 &mut self.session,
                 &mut self.pending,
                 &mut self.hashes,
+                &mut self.pending_hashes,
                 &mut self.desync,
                 &mut self.restart,
                 tick,
@@ -1059,6 +1116,7 @@ mod tests {
         let mut host = Drain::new(host_session);
         let mut joiner = Drain::new(joiner_session);
 
+        joiner.hashes.0.resize(7, 0);
         // A mismatching hash arriving while the joiner is paused is not a desync.
         joiner.restart.phase = RestartPhase::JoinerPaused;
         host.send_and_drain(&mut joiner, NetMessage::HashCheck { tick: 5, hash: 999 }, 0);
@@ -1215,6 +1273,7 @@ mod tests {
         mut pending: ResMut<PendingInputs>,
         mut last_input_tick: ResMut<LastInputTick>,
         mut hashes: ResMut<LocalHashes>,
+        mut pending_hashes: ResMut<PendingHashes>,
         mut desync: ResMut<Desync>,
         mut over: ResMut<OverRes>,
         mut bot: ResMut<BotOpt>,
@@ -1228,10 +1287,84 @@ mod tests {
             &mut pending,
             &mut last_input_tick,
             &mut hashes,
+            &mut pending_hashes,
             &mut desync,
             &mut over,
             &mut bot,
         );
+    }
+
+    fn restart_app(session: NetSession, mode: Mode) -> App {
+        let setup = MatchSetup {
+            mode,
+            map_name: "arena".to_string(),
+            seed: 42,
+            duration_ticks: 10_000,
+            army_size: 4,
+            cursors: vec![(10, 72), (182, 72)],
+        };
+        let mut game = build_game(&setup);
+        game.tick = 1000;
+
+        let mut app = App::new();
+        app.add_event::<AppExit>()
+            .insert_resource(setup)
+            .insert_resource(LwGame(game))
+            .insert_resource(PendingInputs(Vec::new()))
+            .insert_resource(LastInputTick::default())
+            .insert_resource(LocalHashes(Vec::new()))
+            .insert_resource(PendingHashes::default())
+            .insert_resource(Desync(false))
+            .insert_resource(OverRes(None))
+            .insert_resource(NetOpt(Some(session)))
+            .insert_resource(RestartState::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(BotOpt(None))
+            .add_systems(FixedUpdate, fixed_simulate);
+        app
+    }
+
+    #[test]
+    fn online_restart_resets_and_resumes_both_fixed_update_apps() {
+        let (host_session, joiner_session) = test_sessions();
+        let mut host = restart_app(host_session, Mode::Host);
+        let mut joiner = restart_app(joiner_session, Mode::Join);
+
+        joiner
+            .world_mut()
+            .resource_mut::<NetOpt>()
+            .0
+            .as_mut()
+            .unwrap()
+            .send(&NetMessage::RestartRequest)
+            .unwrap();
+
+        let mut completed = false;
+        for _ in 0..1000 {
+            host.world_mut().run_schedule(FixedUpdate);
+            joiner.world_mut().run_schedule(FixedUpdate);
+            let host_game = &host.world().resource::<LwGame>().0;
+            let joiner_game = &joiner.world().resource::<LwGame>().0;
+            if host_game.tick >= 16
+                && host_game.tick == joiner_game.tick
+                && host_game.state_hash() == joiner_game.state_hash()
+                && host.world().resource::<RestartState>().phase == RestartPhase::Idle
+                && joiner.world().resource::<RestartState>().phase == RestartPhase::Idle
+            {
+                completed = true;
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            completed,
+            "both peers should restart and resume in lockstep"
+        );
+        assert!(host.world().resource::<LwGame>().0.tick < 1000);
+        assert!(joiner.world().resource::<LwGame>().0.tick < 1000);
+        assert!(!host.world().resource::<Desync>().0);
+        assert!(!joiner.world().resource::<Desync>().0);
     }
 
     #[test]
@@ -1257,16 +1390,18 @@ mod tests {
         )]));
         world.insert_resource(LastInputTick(Some(7)));
         world.insert_resource(LocalHashes(vec![1, 2, 3]));
+        world.insert_resource(PendingHashes(vec![(7, 9)]));
         world.insert_resource(Desync(true));
         world.insert_resource(OverRes(Some(Scoreboard { counts: vec![1, 1] })));
         world.insert_resource(BotOpt(None));
-        world.spawn(FighterTag);
+        world.spawn(FighterTag { id: usize::MAX });
 
         world.run_system_once(reset_system).unwrap();
 
         assert!(world.resource::<PendingInputs>().0.is_empty());
         assert_eq!(world.resource::<LastInputTick>().0, None);
         assert!(world.resource::<LocalHashes>().0.is_empty());
+        assert!(world.resource::<PendingHashes>().0.is_empty());
         assert!(!world.resource::<Desync>().0);
         assert!(world.resource::<OverRes>().0.is_none());
         // Two teams of eight fighters on a fresh game.

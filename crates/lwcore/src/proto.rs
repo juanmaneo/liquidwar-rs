@@ -8,7 +8,7 @@
 
 use crate::game::Command;
 
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
 
 /// The lockstep input delay, in ticks. Peers send inputs for
 /// `tick + INPUT_DELAY_TICKS` so both sides have them in hand before the
@@ -54,9 +54,15 @@ pub struct TeamSetup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetMessage {
     /// Host begins mutual authentication with a fresh random nonce.
-    Challenge { proto_version: u16, host_nonce: [u8; 32] },
+    Challenge {
+        proto_version: u16,
+        host_nonce: [u8; 32],
+    },
     /// Joiner proves knowledge of the pre-shared secret and contributes a nonce.
-    AuthResponse { client_nonce: [u8; 32], proof: [u8; 32] },
+    AuthResponse {
+        client_nonce: [u8; 32],
+        proof: [u8; 32],
+    },
     /// Host proves knowledge of the same secret.
     AuthProof { proof: [u8; 32] },
     /// Host -> joiner: everything needed to build the identical game.
@@ -126,13 +132,16 @@ impl<'a> Reader<'a> {
         self.take(1).map(|s| s[0])
     }
     fn u16(&mut self) -> Option<u16> {
-        self.take(2).map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+        self.take(2)
+            .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
     }
     fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        self.take(4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
     }
     fn u64(&mut self) -> Option<u64> {
-        self.take(8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+        self.take(8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
     }
     fn i8(&mut self) -> Option<i8> {
         self.take(1).map(|s| s[0] as i8)
@@ -181,12 +190,18 @@ impl NetMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            NetMessage::Challenge { proto_version, host_nonce } => {
+            NetMessage::Challenge {
+                proto_version,
+                host_nonce,
+            } => {
                 out.push(6);
                 put_u16(&mut out, *proto_version);
                 out.extend_from_slice(host_nonce);
             }
-            NetMessage::AuthResponse { client_nonce, proof } => {
+            NetMessage::AuthResponse {
+                client_nonce,
+                proof,
+            } => {
                 out.push(7);
                 out.extend_from_slice(client_nonce);
                 out.extend_from_slice(proof);
@@ -251,12 +266,18 @@ impl NetMessage {
             6 => {
                 let proto_version = r.u16()?;
                 let host_nonce = r.take(32)?.try_into().ok()?;
-                NetMessage::Challenge { proto_version, host_nonce }
+                NetMessage::Challenge {
+                    proto_version,
+                    host_nonce,
+                }
             }
             7 => {
                 let client_nonce = r.take(32)?.try_into().ok()?;
                 let proof = r.take(32)?.try_into().ok()?;
-                NetMessage::AuthResponse { client_nonce, proof }
+                NetMessage::AuthResponse {
+                    client_nonce,
+                    proof,
+                }
             }
             8 => NetMessage::AuthProof {
                 proof: r.take(32)?.try_into().ok()?,
@@ -304,9 +325,15 @@ impl NetMessage {
             }
             5 => NetMessage::Quit,
             9 => NetMessage::RestartRequest,
-            10 => NetMessage::RestartPrepare { restart_id: r.u64()? },
-            11 => NetMessage::RestartReady { restart_id: r.u64()? },
-            12 => NetMessage::RestartCommit { restart_id: r.u64()? },
+            10 => NetMessage::RestartPrepare {
+                restart_id: r.u64()?,
+            },
+            11 => NetMessage::RestartReady {
+                restart_id: r.u64()?,
+            },
+            12 => NetMessage::RestartCommit {
+                restart_id: r.u64()?,
+            },
             _ => return None,
         };
         // Trailing garbage = malformed.
@@ -412,6 +439,7 @@ mod tests {
         assert!(NetMessage::from_bytes(&[]).is_none());
         assert!(NetMessage::from_bytes(&[0]).is_none()); // unknown tag
         assert!(NetMessage::from_bytes(&[1, 1]).is_none()); // truncated u16
+
         // trailing garbage
         let mut b = NetMessage::Quit.to_bytes();
         b.push(0);

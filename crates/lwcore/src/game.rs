@@ -192,12 +192,9 @@ impl Game {
                 spawned += 1;
             }
             for (dx, dy) in DIRS {
-                if let Some((nx, ny)) = self.walkable_neighbor(
-                    (cur % width) as u32,
-                    (cur / width) as u32,
-                    dx,
-                    dy,
-                ) {
+                if let Some((nx, ny)) =
+                    self.walkable_neighbor((cur % width) as u32, (cur / width) as u32, dx, dy)
+                {
                     let ni = self.map.index(nx, ny);
                     if !visited[ni] {
                         visited[ni] = true;
@@ -301,7 +298,10 @@ impl Game {
                     continue;
                 }
                 // No cutting diagonally between two walls.
-                if dx != 0 && dy != 0 && map.is_wall_clamped(x + dx, y) && map.is_wall_clamped(x, y + dy)
+                if dx != 0
+                    && dy != 0
+                    && map.is_wall_clamped(x + dx, y)
+                    && map.is_wall_clamped(x, y + dy)
                 {
                     continue;
                 }
@@ -544,13 +544,7 @@ mod tests {
     use super::*;
 
     fn maze() -> Map {
-        let (m, _) = Map::from_ascii(&[
-            "#######",
-            "#.....#",
-            "###.###",
-            "#.....#",
-            "#######",
-        ]);
+        let (m, _) = Map::from_ascii(&["#######", "#.....#", "###.###", "#.....#", "#######"]);
         m
     }
 
@@ -577,13 +571,7 @@ mod tests {
 
     #[test]
     fn gradient_unreachable_is_inf() {
-        let (mut m, _) = Map::from_ascii(&[
-            "#######",
-            "#.....#",
-            "#######",
-            "#.....#",
-            "#######",
-        ]);
+        let (mut m, _) = Map::from_ascii(&["#######", "#.....#", "#######", "#.....#", "#######"]);
         // two rooms, no connection
         for y in 0..5 {
             m.set_wall(3, y, true);
@@ -600,7 +588,11 @@ mod tests {
         let mut g = Game::new(Map::arena(), GameParams::default(), 7);
         let t0 = g.add_team((10, 10));
         g.spawn_army(t0, 1);
-        g.command(Command::SetCursor { team: t0, x: 150, y: 10 });
+        g.command(Command::SetCursor {
+            team: t0,
+            x: 150,
+            y: 10,
+        });
         g.tick();
         let view = g.fighters().next().unwrap();
         // Was at (10,10); after one tick it must have taken a step toward
@@ -615,7 +607,11 @@ mod tests {
         let mut g = Game::new(Map::arena(), GameParams::default(), 3);
         let t0 = g.add_team((10, 10));
         g.spawn_army(t0, 50);
-        g.command(Command::SetCursor { team: t0, x: 150, y: 100 });
+        g.command(Command::SetCursor {
+            team: t0,
+            x: 150,
+            y: 100,
+        });
         for _ in 0..250 {
             g.tick();
         }
@@ -673,7 +669,11 @@ mod tests {
             for i in 0..300 {
                 let dx = rng.below(3) as i32 - 1;
                 let dy = rng.below(3) as i32 - 1;
-                g.command(Command::MoveCursor { team: 0, dx: dx as i8, dy: dy as i8 });
+                g.command(Command::MoveCursor {
+                    team: 0,
+                    dx: dx as i8,
+                    dy: dy as i8,
+                });
                 if i % 5 == 0 {
                     g.command(Command::SetCursor {
                         team: 1,

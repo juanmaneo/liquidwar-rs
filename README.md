@@ -84,8 +84,9 @@ tools/
   `lwcore::Command`s, drives a deliberately simple greedy bot
   (`--vs-ai`), and implements **lockstep netplay** over TCP: peers exchange
   only cursor commands (never state), with an 8-tick input delay, mutual
-  authentication using `LIQUIDWAR_PASSWORD`, HMAC-SHA256 frame integrity,
-  and a per-tick hash check that flags simulation desyncs.
+  authentication using `LIQUIDWAR_PASSWORD`, ChaCha20-Poly1305 authenticated
+  encryption for every frame, and a per-tick hash check that flags simulation
+  desyncs.
 
 ### Netcode
 
@@ -98,7 +99,10 @@ after every tick so any divergence is caught within a second.
 ## Testing
 
 ```sh
-# unit tests (gradient, invariants, determinism, protocol...)
+# Bevy/netplay tests, including authenticated encrypted framing and online restart
+cargo test -p lwbevy
+
+# core unit tests (gradient, invariants, determinism, protocol...)
 cargo test -p lwcore
 
 # the same scenario suite on a second platform (wasm via Node)
@@ -110,12 +114,12 @@ occupancy, conserved fighter counts), cursor clamping/sliding along
 walls, liquid convergence of a full army, multi-team determinism, a full
 lockstep loopback through the wire protocol, and front-line battles.
 
-Online mode authenticates both peers and integrity-protects every frame,
-but does not encrypt traffic. Use a long, randomly generated shared secret;
-passwords are not transmitted, though an offline attacker can still attempt
-guesses against captured authentication proofs.
+Online mode authenticates both peers and encrypts/authenticates every frame
+with ChaCha20-Poly1305. Use a long, randomly generated shared secret: captured
+handshakes still allow offline guesses against weak secrets. Encryption does
+not hide connection metadata such as peer addresses or traffic timing.
 
-## Known limitations (v2)
+## Known limitations (v3)
 
 - No graphical/sound polish: flat colored squares, one wall texture.
 - Online restarts are coordinated: pressing R sends a restart request, the
